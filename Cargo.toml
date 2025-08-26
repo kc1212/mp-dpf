@@ -1,0 +1,10 @@
+[package]
+name = "mp-dpf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitvec = "1.0.1"
+nalgebra = { version = "0.34.0", features = ["rand"] }
+rand = "0.9.2"
+rand_chacha = "0.9.0"
