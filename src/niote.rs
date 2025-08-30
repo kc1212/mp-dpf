@@ -178,17 +178,36 @@ pub fn reconstruct(
 
 #[cfg(test)]
 mod tests {
+    use proptest::{
+        arbitrary::{StrategyFor, arbitrary_with},
+        prelude::*,
+        sample::size_range,
+    };
     use rand::SeedableRng;
     use rand_chacha::ChaCha12Rng;
 
     use super::*;
 
-    #[test]
-    fn test_protocol() {
+    fn gen_vec_wrapping(m: usize) -> StrategyFor<Vec<Wrapping<u64>>> {
+        arbitrary_with(size_range(m).lift())
+    }
+
+    fn gen_bool(m: usize) -> StrategyFor<Vec<bool>> {
+        arbitrary_with(size_range(m).lift())
+    }
+
+    proptest! {
+        #[test]
+        fn test_protocol(xs in gen_vec_wrapping(4), ys in gen_bool(2)) {
+            run_protocol(xs, ys);
+        }
+    }
+
+    fn run_protocol(xs: Vec<Wrapping<u64>>, ys: Vec<bool>) {
         let param = HalfNIOTEparam {
             log_q: 64,
-            m: 16,
-            ell: 2,
+            m: xs.len(),
+            ell: ys.len(),
             k: 2,
             stddev: 3.2,
         };
@@ -199,10 +218,10 @@ mod tests {
         let b_mat = bob_setup(param, &mut rng);
         let pk = NIOTEpk { a_mat, b_mat };
 
-        let x_vec = na::DVector::from_vec(vec![Wrapping(0u64); param.m]);
+        let x_vec = na::DVector::from_vec(xs);
         let (d, psi) = alice_encode(&pk.a_mat, &x_vec);
 
-        let y_vec = na::DVector::from_vec(vec![Wrapping(1u64); param.ell]);
+        let y_vec = na::DVector::from_vec(ys.into_iter().map(|y| Wrapping(y as u64)).collect());
         let (c, phi) = bob_encode(&param, &pk, &y_vec, &mut rng);
 
         let v = alice_decode(&c, &psi);
