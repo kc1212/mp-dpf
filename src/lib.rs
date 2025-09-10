@@ -3,6 +3,7 @@ use std::num::Wrapping;
 use nalgebra as na;
 use rand::{CryptoRng, Rng, distr::Distribution};
 
+pub mod half_niote;
 pub mod niote;
 
 pub struct UniformRandom;
