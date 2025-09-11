@@ -6,18 +6,18 @@ use rand::{CryptoRng, Rng};
 
 use crate::sample_discrete_gaussian;
 
-pub struct NIOTEpk {
+pub struct HalfNIOTEpk {
     pub a_mat: na::DMatrix<Wrapping<u64>>,
     pub b_mat: na::DMatrix<Wrapping<u64>>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct HalfNIOTEparam {
-    log_q: u64, // fixed to 64
-    m: usize,
-    ell: usize,
-    k: usize, // lwe dim
-    stddev: f64,
+    pub log_q: u64, // fixed to 64
+    pub m: usize,
+    pub ell: usize,
+    pub k: usize, // lwe dim
+    pub stddev: f64,
 }
 
 impl HalfNIOTEparam {
@@ -25,16 +25,27 @@ impl HalfNIOTEparam {
         self.k * self.log_q as usize
     }
 
+    // length of Alice's input
     pub fn m(&self) -> usize {
         self.m
     }
-    
+
     pub fn log_q(&self) -> u64 {
         self.log_q
     }
+
+    // length of Bob's input
+    pub fn ell(&self) -> usize {
+        self.ell
+    }
+
+    // length of the LWE secret
+    pub fn k(&self) -> usize {
+        self.k
+    }
 }
 
-pub fn setup<R: Rng + CryptoRng>(param: HalfNIOTEparam, _rng: &mut R) -> NIOTEpk {
+pub fn setup<R: Rng + CryptoRng>(param: HalfNIOTEparam, _rng: &mut R) -> HalfNIOTEpk {
     // let a_mat = na::DMatrix::<bool>::from_distribution_generic(
     //     nalgebra::Dyn(param.n),
     //     nalgebra::Dyn(param.m * param.log_q),
@@ -48,7 +59,7 @@ pub fn setup<R: Rng + CryptoRng>(param: HalfNIOTEparam, _rng: &mut R) -> NIOTEpk
         na::DMatrix::<bool>::new_random(param.n(), param.m * param.ell * param.n() as usize);
     let b_mat = b_mat.map(|x| if x { Wrapping(1u64) } else { Wrapping(0u64) });
 
-    NIOTEpk { a_mat, b_mat }
+    HalfNIOTEpk { a_mat, b_mat }
 }
 
 fn bits(x_vec: na::DVectorView<Wrapping<u64>>) -> na::DVector<Wrapping<u64>> {
@@ -69,9 +80,10 @@ fn bits(x_vec: na::DVectorView<Wrapping<u64>>) -> na::DVector<Wrapping<u64>> {
 
 /// returns (d, psi = x_hat)
 pub fn alice_encode(
-    a_mat: na::DMatrixView<Wrapping<u64>>,
+    pk: &HalfNIOTEpk,
     x_vec: na::DVectorView<Wrapping<u64>>,
 ) -> (na::DVector<Wrapping<u64>>, na::DVector<Wrapping<u64>>) {
+    let a_mat: na::DMatrixView<Wrapping<u64>> = pk.a_mat.as_view();
     let x_vec_hat = bits(x_vec);
     debug_assert_eq!(x_vec_hat.len(), x_vec.len() * 64);
     let d = a_mat * &x_vec_hat;
@@ -79,29 +91,24 @@ pub fn alice_encode(
 }
 
 // this can be a constant/lazy static
-pub(crate) fn gadget_vec(logq: u64) -> na::DVector<Wrapping<u64>> {
-    let mut v = Vec::with_capacity(logq as usize);
-    for i in 0..logq {
+pub(crate) fn gadget_vec(log_q: u64) -> na::DVector<Wrapping<u64>> {
+    let mut v = Vec::with_capacity(log_q as usize);
+    for i in 0..log_q {
         v.push(Wrapping(1u64 << i));
     }
     na::DVector::from_vec(v)
 }
 
-fn gadget_mat(k: usize, logq: usize) -> na::DMatrix<Wrapping<u64>> {
-    let g_vec = gadget_vec(logq as u64);
-    let id_g = na::DMatrix::identity(k, k);
-    id_g.kronecker(&g_vec)
-}
-
 // returns (c, phi=s)
 pub fn bob_encode(
-    param: &HalfNIOTEparam,
-    pk: &NIOTEpk,
+    param: HalfNIOTEparam,
+    pk: &HalfNIOTEpk,
     y_vec: na::DVectorView<Wrapping<u64>>,
     rng: &mut (impl Rng + CryptoRng),
 ) -> (na::DMatrix<Wrapping<u64>>, na::DVector<Wrapping<u64>>) {
     // B * (I_{m \ell} \otimes s \otimes g^T_q)
     let s = na::DVector::<Wrapping<u64>>::new_random(param.k);
+    debug_assert_eq!(s.shape(), (param.k, 1)); // This means it is a column matrix
     let id_ml = na::DMatrix::identity(param.m * param.ell, param.m * param.ell);
     let g_vec = gadget_vec(param.log_q);
     debug_assert_eq!(
@@ -144,8 +151,8 @@ pub fn bob_encode(
 
 // returns v = C^T * x_hat
 pub fn alice_decode(
-    c_mat: &na::DMatrix<Wrapping<u64>>,
-    psi: &na::DVector<Wrapping<u64>>,
+    c_mat: na::DMatrixView<Wrapping<u64>>,
+    psi: na::DVectorView<Wrapping<u64>>,
 ) -> na::DVector<Wrapping<u64>> {
     let x_vec_hat = psi;
     c_mat.transpose() * x_vec_hat
@@ -153,10 +160,10 @@ pub fn alice_decode(
 
 // returns w = - (I_{m \ell} \otimes s^T \otimes g_q) * B^T * d
 pub fn bob_decode(
-    param: &HalfNIOTEparam,
-    pk: &NIOTEpk,
-    d_vec: &na::DVector<Wrapping<u64>>,
-    phi: &na::DVector<Wrapping<u64>>,
+    param: HalfNIOTEparam,
+    pk: &HalfNIOTEpk,
+    d_vec: na::DVectorView<Wrapping<u64>>,
+    phi: na::DVectorView<Wrapping<u64>>,
 ) -> na::DVector<Wrapping<u64>> {
     let id_ml = na::DMatrix::identity(param.m * param.ell, param.m * param.ell);
     let s = phi;
@@ -167,9 +174,9 @@ pub fn bob_decode(
 }
 
 pub fn reconstruct(
-    param: &HalfNIOTEparam,
-    v: &na::DVector<Wrapping<u64>>,
-    w: &na::DVector<Wrapping<u64>>,
+    param: HalfNIOTEparam,
+    v: na::DVectorView<Wrapping<u64>>,
+    w: na::DVectorView<Wrapping<u64>>,
 ) -> na::DVector<Wrapping<u64>> {
     (v + w).map(|x| {
         // we need to divide by q/2 and round
@@ -219,17 +226,18 @@ mod tests {
         let pk = setup(param, &mut rng);
 
         let x_vec = na::DVector::from_vec(xs);
-        let (d, psi) = alice_encode(pk.a_mat.as_view(), x_vec.as_view());
+        let (d, psi) = alice_encode(&pk, x_vec.as_view());
 
         let y_vec = na::DVector::from_vec(ys.into_iter().map(|y| Wrapping(y as u64)).collect());
-        let (c, phi) = bob_encode(&param, &pk, y_vec.as_view(), &mut rng);
+        let (c, phi) = bob_encode(param, &pk, y_vec.as_view(), &mut rng);
+        assert_eq!(phi.shape(), (param.k, 1));
 
-        let v = alice_decode(&c, &psi);
-        let w = bob_decode(&param, &pk, &d, &phi);
+        let v = alice_decode(c.as_view(), psi.as_view());
+        let w = bob_decode(param, &pk, d.as_view(), phi.as_view());
         assert_eq!(v.shape(), (param.m * param.ell, 1));
         assert_eq!(v.shape(), w.shape());
 
-        let res = reconstruct(&param, &v, &w);
+        let res = reconstruct(param, v.as_view(), w.as_view());
         assert_eq!(v.shape(), res.shape());
 
         // round(v + m)_p = x \otimes y mod p
