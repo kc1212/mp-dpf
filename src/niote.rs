@@ -62,6 +62,7 @@ pub fn setup<R: Rng + CryptoRng>(param: NIOTEparam, rng: &mut R) -> NIOTEpk {
 }
 
 // output (d, psi)
+#[allow(clippy::type_complexity)]
 pub fn alice_encode(
     param: NIOTEparam,
     pk: &NIOTEpk,
@@ -109,6 +110,10 @@ pub fn bob_encode(
     let mut e_out = Vec::with_capacity(param.r);
     // the first iteration is different from the rest in terms of dimension, so we do it separately
     let (e_mat_0, phi_1) = half_niote::bob_encode(param.half, &pk.half, y_vec, rng);
+    debug_assert_eq!(
+        e_mat_0.shape(),
+        (param.t * param.n(), param.t * param.n() * param.ell())
+    );
     e_out.push(e_mat_0);
 
     let g = gadget_vec(param.log_q());
@@ -119,6 +124,7 @@ pub fn bob_encode(
     //         let (e_mat_i, phi_ip1) = half_niote::bob_encode(param.half, pk, y_i.as_view(), rng);
     //         phi_ip1.kronecker(&g)
     // });
+    println!("bob encode loop");
     for i in 1..param.r {
         debug_assert_eq!(y_i.shape(), (param.log_q() as usize * param.k(), 1));
         let (e_mat_i, phi_ip1) = half_niote::bob_encode(param.half, &pk.half, y_i.as_view(), rng);
@@ -234,7 +240,7 @@ mod tests {
 
         // m = t^r n
         let m = xs.len();
-        let n = m / t.pow(r as u32); // m / t^r
+        let n = m / t.pow(r as u32); // n = m / t^r
         let half = HalfNIOTEparam {
             log_q,
             m: t * n,

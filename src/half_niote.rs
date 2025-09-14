@@ -55,8 +55,7 @@ pub fn setup<R: Rng + CryptoRng>(param: HalfNIOTEparam, _rng: &mut R) -> HalfNIO
     let a_mat = na::DMatrix::<bool>::new_random(param.n(), param.m * param.log_q as usize);
     let a_mat = a_mat.map(|x| if x { Wrapping(1u64) } else { Wrapping(0u64) });
 
-    let b_mat =
-        na::DMatrix::<bool>::new_random(param.n(), param.m * param.ell * param.n() as usize);
+    let b_mat = na::DMatrix::<bool>::new_random(param.n(), param.m * param.ell * param.n());
     let b_mat = b_mat.map(|x| if x { Wrapping(1u64) } else { Wrapping(0u64) });
 
     HalfNIOTEpk { a_mat, b_mat }
@@ -99,6 +98,25 @@ pub(crate) fn gadget_vec(log_q: u64) -> na::DVector<Wrapping<u64>> {
     na::DVector::from_vec(v)
 }
 
+fn compute_z(
+    param: HalfNIOTEparam,
+    pk: &HalfNIOTEpk,
+    s: na::DVectorView<Wrapping<u64>>,
+    g_vec: na::DVectorView<Wrapping<u64>>,
+) -> na::DMatrix<Wrapping<u64>> {
+    let id_ml = na::DMatrix::identity(param.m * param.ell, param.m * param.ell);
+    &pk.b_mat * id_ml.kronecker(&s.kronecker(&g_vec))
+}
+
+fn compute_z_prime(
+    param: HalfNIOTEparam,
+    y_delta_vec: na::DVectorView<Wrapping<u64>>,
+    g_vec: na::DVectorView<Wrapping<u64>>,
+) -> na::DMatrix<Wrapping<u64>> {
+    let id_m = na::DMatrix::identity(param.m, param.m);
+    id_m.kronecker(&y_delta_vec.transpose().kronecker(&g_vec))
+}
+
 // returns (c, phi=s)
 pub fn bob_encode(
     param: HalfNIOTEparam,
@@ -107,22 +125,20 @@ pub fn bob_encode(
     rng: &mut (impl Rng + CryptoRng),
 ) -> (na::DMatrix<Wrapping<u64>>, na::DVector<Wrapping<u64>>) {
     // B * (I_{m \ell} \otimes s \otimes g^T_q)
-    let s = na::DVector::<Wrapping<u64>>::new_random(param.k);
-    debug_assert_eq!(s.shape(), (param.k, 1)); // This means it is a column matrix
-    let id_ml = na::DMatrix::identity(param.m * param.ell, param.m * param.ell);
+    let s_vec = na::DVector::<Wrapping<u64>>::new_random(param.k);
+    debug_assert_eq!(s_vec.shape(), (param.k, 1)); // This means it is a column matrix
     let g_vec = gadget_vec(param.log_q);
     debug_assert_eq!(
         pk.b_mat.shape(),
         (param.n(), param.m * param.ell * param.n())
     );
-    let z = &pk.b_mat * id_ml.kronecker(&s.kronecker(&g_vec));
+    let z = compute_z(param, pk, s_vec.as_view(), g_vec.as_view());
     debug_assert_eq!(z.shape(), (param.n(), param.m * param.ell));
 
     // I_m \otimes (y * q/2)^T \otimes g^T_q
-    let id_m = na::DMatrix::identity(param.m, param.m);
     let delta = Wrapping(1u64 << (param.log_q - 1)); // q/2
     let y_delta_vec = y_vec * delta;
-    let z_prime = id_m.kronecker(&y_delta_vec.transpose().kronecker(&g_vec));
+    let z_prime = compute_z_prime(param, y_delta_vec.as_view(), g_vec.as_view());
     debug_assert_eq!(
         z_prime.shape(),
         (param.m * param.log_q as usize, param.m * param.ell)
@@ -146,7 +162,7 @@ pub fn bob_encode(
     );
 
     // send c_mat to alice
-    (c_mat, s)
+    (c_mat, s_vec)
 }
 
 // returns v = C^T * x_hat
