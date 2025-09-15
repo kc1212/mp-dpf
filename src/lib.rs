@@ -82,10 +82,10 @@ impl<'a> Index<(usize, usize)> for LazyIdentityKronecker<'a> {
     }
 }
 
-impl<'a> Add<LazyIdentityKronecker<'a>> for na::DMatrixView<'_, Wrapping<u64>> {
+impl<'a> Add<&LazyIdentityKronecker<'a>> for na::DMatrixView<'_, Wrapping<u64>> {
     type Output = na::DMatrix<Wrapping<u64>>;
 
-    fn add(self, rhs: LazyIdentityKronecker<'a>) -> Self::Output {
+    fn add(self, rhs: &LazyIdentityKronecker<'a>) -> Self::Output {
         let mut out = na::DMatrix::<Wrapping<u64>>::zeros(self.shape().0, self.shape().1);
         izip!(out.row_iter_mut(), self.row_iter())
             .enumerate()
@@ -97,6 +97,13 @@ impl<'a> Add<LazyIdentityKronecker<'a>> for na::DMatrixView<'_, Wrapping<u64>> {
                     })
             });
         out
+    }
+}
+
+impl<'a> Add<LazyIdentityKronecker<'a>> for na::DMatrixView<'_, Wrapping<u64>> {
+    type Output = na::DMatrix<Wrapping<u64>>;
+    fn add(self, rhs: LazyIdentityKronecker<'a>) -> Self::Output {
+        self + &rhs
     }
 }
 

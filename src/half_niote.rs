@@ -111,14 +111,14 @@ fn compute_z(
     pk.b_mat.as_view() * LazyIdentityKronecker::new(param.m * param.ell, s_mul_g.as_view())
 }
 
-fn compute_z_prime(
-    param: HalfNIOTEparam,
-    y_delta_vec: na::DVectorView<Wrapping<u64>>,
-    g_vec: na::DVectorView<Wrapping<u64>>,
-) -> na::DMatrix<Wrapping<u64>> {
-    let id_m = na::DMatrix::identity(param.m, param.m);
-    id_m.kronecker(&y_delta_vec.transpose().kronecker(&g_vec))
-}
+// fn compute_z_prime(
+//     param: HalfNIOTEparam,
+//     y_delta_vec: na::DVectorView<Wrapping<u64>>,
+//     g_vec: na::DVectorView<Wrapping<u64>>,
+// ) -> na::DMatrix<Wrapping<u64>> {
+//     let id_m = na::DMatrix::identity(param.m, param.m);
+//     id_m.kronecker(&y_delta_vec.transpose().kronecker(&g_vec))
+// }
 
 // returns (c, phi=s)
 pub fn bob_encode(
@@ -141,7 +141,11 @@ pub fn bob_encode(
     // I_m \otimes (y * q/2)^T \otimes g^T_q
     let delta = Wrapping(1u64 << (param.log_q - 1)); // q/2
     let y_delta_vec = y_vec * delta;
-    let z_prime = compute_z_prime(param, y_delta_vec.as_view(), g_vec.as_view());
+
+    // let z_prime = compute_z_prime(param, y_delta_vec.as_view(), g_vec.as_view());
+    let y_kro_g = y_delta_vec.transpose().kronecker(&g_vec);
+    let z_prime = LazyIdentityKronecker::new(param.m, y_kro_g.as_view());
+
     debug_assert_eq!(
         z_prime.shape(),
         (param.m * param.log_q as usize, param.m * param.ell)
@@ -158,7 +162,7 @@ pub fn bob_encode(
 
     // put everything together
     let a_mat_t = pk.a_mat.transpose();
-    let c_mat = &a_mat_t * z + a_mat_t * e_prime + e_tilde + z_prime;
+    let c_mat = &a_mat_t * z + a_mat_t * e_prime + (e_tilde.as_view() + z_prime);
     debug_assert_eq!(
         c_mat.shape(),
         (param.m * param.log_q as usize, param.m * param.ell)

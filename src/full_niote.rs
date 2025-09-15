@@ -116,6 +116,10 @@ pub fn bob_encode(
     );
     e_out.push(e_mat_0);
 
+    if param.r == 1 {
+        return (e_out, phi_1);
+    }
+
     let g = gadget_vec(param.log_q());
     let mut y_i = phi_1.kronecker(&g);
 
@@ -124,7 +128,6 @@ pub fn bob_encode(
     //         let (e_mat_i, phi_ip1) = half_niote::bob_encode(param.half, pk, y_i.as_view(), rng);
     //         phi_ip1.kronecker(&g)
     // });
-    println!("bob encode loop");
     for i in 1..param.r {
         debug_assert_eq!(y_i.shape(), (param.log_q() as usize * param.k(), 1));
         let (e_mat_i, phi_ip1) = half_niote::bob_encode(param.half, &pk.half, y_i.as_view(), rng);
