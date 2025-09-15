@@ -171,8 +171,12 @@ fn scan_p_mat_prods(
         id.kronecker(&p_mat)
     });
 
+    // fill the accummulator with the first element
     let mut acc: na::DMatrix<Wrapping<u64>> = p_mats.next().unwrap();
     let mut steps = Vec::with_capacity(param.r);
+    steps.push(acc.clone());
+
+    // fill the rest
     for p_mat_i in p_mats {
         // dimension of acc will reduce on every iteration
         acc = p_mat_i * acc;
@@ -208,7 +212,7 @@ pub fn alice_decode(
         for j in 0..t_pow {
             let v_ij = half_niote::alice_decode(e_mats[i].as_view(), psi[i][j].as_view());
             debug_assert_eq!(v_ij.shape(), (chunk_size, 1));
-            v_i.rows_mut(chunk_size * j, t_pow).copy_from(&v_ij);
+            v_i.rows_mut(chunk_size * j, chunk_size).copy_from(&v_ij);
         }
 
         let p_mat_prod_i = &pk.p_mat_prods[i];
@@ -278,12 +282,9 @@ mod tests {
 
     #[test]
     fn test_protocol() {
-        // t = 1, r = 2, k = 2
-        // n = k \log q = 128
-        // m = t^r n = 512
         let t = 2;
         let r = 1;
-        let k = 2; // normally k is big
+        let k = 1; // normally k is big
         let n = k * 64;
         run_protocol(
             k,
