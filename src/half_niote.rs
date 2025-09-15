@@ -4,7 +4,7 @@ use bitvec::{order::Lsb0, view::BitView};
 use nalgebra as na;
 use rand::{CryptoRng, Rng};
 
-use crate::sample_discrete_gaussian;
+use crate::{LazyIdentityKronecker, sample_discrete_gaussian};
 
 pub struct HalfNIOTEpk {
     pub a_mat: na::DMatrix<Wrapping<u64>>,
@@ -104,8 +104,11 @@ fn compute_z(
     s: na::DVectorView<Wrapping<u64>>,
     g_vec: na::DVectorView<Wrapping<u64>>,
 ) -> na::DMatrix<Wrapping<u64>> {
-    let id_ml = na::DMatrix::identity(param.m * param.ell, param.m * param.ell);
-    &pk.b_mat * id_ml.kronecker(&s.kronecker(&g_vec))
+    // let id_ml = na::DMatrix::identity(param.m * param.ell, param.m * param.ell);
+    // &pk.b_mat * id_ml.kronecker(&s.kronecker(&g_vec))
+    // NOTE: compared to the above, we have about −96.639% improvement
+    let s_mul_g = s.kronecker(&g_vec);
+    pk.b_mat.as_view() * LazyIdentityKronecker::new(param.m * param.ell, s_mul_g.as_view())
 }
 
 fn compute_z_prime(
