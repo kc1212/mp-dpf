@@ -152,18 +152,27 @@ fn scan_p_mat_prods(
     param: NIOTEparam,
     p_mat: na::DMatrixView<Wrapping<u64>>,
 ) -> Vec<na::DMatrix<Wrapping<u64>>> {
-    let p_mats = (0..param.r).map(|i| {
+    // P: n \times tn
+    assert_eq!(p_mat.shape(), (param.n(), param.t * param.n()));
+
+    // P_i will have dimension (n*t^{r - 1 - i}, n*t^{r - i})
+    // below we remove the factor n for brevity, so the above becomes (t^{r - 1 - i}, t^{r - i})
+    // P_1 * P_0         : (t^{r - 2}, t^{r - 1}) * (t^{r - 1}, n*t^{r})
+    //                   : (t^{r - 2}, t^{r})
+    // P_2 * P_1 * P_0   : (t^{r - 3}, t^{r - 2}), (t^{r - 2}, t^{r})
+    //                   : (t^{r - 3}, t^{r})
+    // P_{r-1} *...* P_0 : (t^0, t^r)
+    let mut p_mats = (0..param.r).map(|i| {
         let t_pow = param.t_pow_r_minus_i_1(i);
         let id = na::DMatrix::identity(t_pow, t_pow);
         id.kronecker(&p_mat)
     });
 
-    let init_dim = param.n() * param.t.pow(param.r as u32);
-    let mut acc: na::DMatrix<Wrapping<u64>> = na::DMatrix::identity(init_dim, init_dim);
+    let mut acc: na::DMatrix<Wrapping<u64>> = p_mats.next().unwrap();
     let mut steps = Vec::with_capacity(param.r);
     for p_mat_i in p_mats {
         // dimension of acc will reduce on every iteration
-        acc *= p_mat_i;
+        acc = p_mat_i * acc;
         steps.push(acc.clone());
     }
     steps
@@ -240,10 +249,9 @@ mod tests {
 
         // m = t^r n
         let m = xs.len();
-        let n = m / t.pow(r as u32); // n = m / t^r
         let half = HalfNIOTEparam {
             log_q,
-            m: t * n,
+            m,
             ell,
             k,
             stddev: 3.2,
@@ -270,9 +278,9 @@ mod tests {
         // t = 1, r = 2, k = 2
         // n = k \log q = 128
         // m = t^r n = 512
-        let t = 1;
-        let r = 2;
-        let k = 2;
+        let t = 2;
+        let r = 1;
+        let k = 2; // normally k is big
         let n = k * 64;
         run_protocol(
             k,
