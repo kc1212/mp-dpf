@@ -110,9 +110,15 @@ pub fn bob_encode(
     let mut e_out = Vec::with_capacity(param.r);
     // the first iteration is different from the rest in terms of dimension, so we do it separately
     let (e_mat_0, phi_1) = half_niote::bob_encode(param.half, &pk.half, y_vec, rng);
+
+    // note that usually for hOTE the output dimension is (m log q, m l)
+    // but here we've instantiated hOTE with size m = nt
     debug_assert_eq!(
         e_mat_0.shape(),
-        (param.t * param.n(), param.t * param.n() * param.ell())
+        (
+            param.t * param.n() * param.log_q() as usize,
+            param.t * param.n() * param.ell()
+        )
     );
     e_out.push(e_mat_0);
 
@@ -264,6 +270,7 @@ mod tests {
             stddev: 3.2,
         };
         let param = NIOTEparam { half, t, r };
+        println!("starting full niote with param {param:?}");
 
         let mut rng = ChaCha12Rng::from_os_rng();
         let pk = setup(param, &mut rng);

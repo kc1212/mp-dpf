@@ -255,6 +255,13 @@ mod tests {
         let (c, phi) = bob_encode(param, &pk, y_vec.as_view(), &mut rng);
         assert_eq!(phi.shape(), (param.k, 1));
 
+        // note that because the A matrix is not n by m anymore, but n by m log q,
+        // that's why the dimension of C needs to be multiplied by log q
+        assert_eq!(
+            c.shape(),
+            (param.m * param.log_q as usize, param.m * param.ell)
+        );
+
         let v = alice_decode(c.as_view(), psi.as_view());
         let w = bob_decode(param, &pk, d.as_view(), phi.as_view());
         assert_eq!(v.shape(), (param.m * param.ell, 1));
