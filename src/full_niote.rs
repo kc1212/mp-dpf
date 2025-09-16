@@ -1,9 +1,10 @@
-use std::num::Wrapping;
-
 use nalgebra as na;
 use rand::{CryptoRng, Rng};
 
-use crate::half_niote::{self, HalfNIOTEparam, HalfNIOTEpk, gadget_vec};
+use crate::{
+    Scalar,
+    half_niote::{self, HalfNIOTEparam, HalfNIOTEpk, gadget_vec},
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct NIOTEparam {
@@ -42,17 +43,17 @@ impl NIOTEparam {
     }
 }
 
-pub struct NIOTEpk {
-    half: HalfNIOTEpk,
-    p_mat_prods: Vec<na::DMatrix<Wrapping<u64>>>,
+pub struct NIOTEpk<S: Scalar> {
+    half: HalfNIOTEpk<S>,
+    p_mat_prods: Vec<na::DMatrix<S>>,
 }
 
-pub fn setup<R: Rng + CryptoRng>(param: NIOTEparam, rng: &mut R) -> NIOTEpk {
+pub fn setup<R: Rng + CryptoRng, S: Scalar>(param: NIOTEparam, rng: &mut R) -> NIOTEpk<S> {
     let pk = half_niote::setup(param.half, rng);
 
-    let ident_tn = na::DMatrix::identity(param.t * param.n(), param.t * param.n());
-    let g = gadget_vec(param.log_q());
-    let p_mat = &pk.a_mat * (ident_tn.kronecker(&g));
+    let ident_tn: na::DMatrix<S> = na::DMatrix::identity(param.t * param.n(), param.t * param.n());
+    let g = gadget_vec::<S>();
+    let p_mat: na::DMatrix<S> = &pk.a_mat * (ident_tn.kronecker(&g));
     let p_mat_prods = scan_p_mat_prods(param, p_mat.as_view());
 
     NIOTEpk {
@@ -63,14 +64,11 @@ pub fn setup<R: Rng + CryptoRng>(param: NIOTEparam, rng: &mut R) -> NIOTEpk {
 
 // output (d, psi)
 #[allow(clippy::type_complexity)]
-pub fn alice_encode(
+pub fn alice_encode<S: Scalar>(
     param: NIOTEparam,
-    pk: &NIOTEpk,
-    x_vec: na::DVectorView<Wrapping<u64>>,
-) -> (
-    na::DVector<Wrapping<u64>>,
-    Vec<Vec<na::DVector<Wrapping<u64>>>>,
-) {
+    pk: &NIOTEpk<S>,
+    x_vec: na::DVectorView<S>,
+) -> (na::DVector<S>, Vec<Vec<na::DVector<S>>>) {
     let mut x_i = x_vec.clone_owned();
     let mut psi_out = vec![];
     for i in 0..param.r {
@@ -101,12 +99,15 @@ pub fn alice_encode(
 }
 
 // output { E_i }, phi
-pub fn bob_encode(
+pub fn bob_encode<S: Scalar>(
     param: NIOTEparam,
-    pk: &NIOTEpk,
-    y_vec: na::DVectorView<Wrapping<u64>>,
+    pk: &NIOTEpk<S>,
+    y_vec: na::DVectorView<S>,
     rng: &mut (impl Rng + CryptoRng),
-) -> (Vec<na::DMatrix<Wrapping<u64>>>, na::DVector<Wrapping<u64>>) {
+) -> (Vec<na::DMatrix<S>>, na::DVector<S>)
+where
+    rand::distr::StandardUniform: rand::distr::Distribution<S>,
+{
     let mut e_out = Vec::with_capacity(param.r);
     // the first iteration is different from the rest in terms of dimension, so we do it separately
     let (e_mat_0, phi_1) = half_niote::bob_encode(param.half, &pk.half, y_vec, rng);
@@ -126,7 +127,7 @@ pub fn bob_encode(
         return (e_out, phi_1);
     }
 
-    let g = gadget_vec(param.log_q());
+    let g = gadget_vec::<S>();
     let mut y_i = phi_1.kronecker(&g);
 
     // TODO maybe there's a more elegant way of writing the logic
@@ -157,10 +158,10 @@ pub fn bob_encode(
 // compute
 // \{  \prod_i=1^k P_i  \} for k \in [r]
 // where P_i = I_{t^{r-i-1}} \otimes P
-fn scan_p_mat_prods(
+fn scan_p_mat_prods<S: Scalar>(
     param: NIOTEparam,
-    p_mat: na::DMatrixView<Wrapping<u64>>,
-) -> Vec<na::DMatrix<Wrapping<u64>>> {
+    p_mat: na::DMatrixView<S>,
+) -> Vec<na::DMatrix<S>> {
     // P: n \times tn
     assert_eq!(p_mat.shape(), (param.n(), param.t * param.n()));
 
@@ -178,7 +179,7 @@ fn scan_p_mat_prods(
     });
 
     // fill the accummulator with the first element
-    let mut acc: na::DMatrix<Wrapping<u64>> = p_mats.next().unwrap();
+    let mut acc: na::DMatrix<S> = p_mats.next().unwrap();
     let mut steps = Vec::with_capacity(param.r);
     steps.push(acc.clone());
 
@@ -192,12 +193,12 @@ fn scan_p_mat_prods(
 }
 
 // output v_r
-pub fn alice_decode(
+pub fn alice_decode<S: Scalar>(
     param: NIOTEparam,
-    pk: &NIOTEpk,
-    e_mats: &[na::DMatrix<Wrapping<u64>>],
-    psi: &[Vec<na::DVector<Wrapping<u64>>>],
-) -> na::DVector<Wrapping<u64>> {
+    pk: &NIOTEpk<S>,
+    e_mats: &[na::DMatrix<S>],
+    psi: &[Vec<na::DVector<S>>],
+) -> na::DVector<S> {
     assert_eq!(e_mats.len(), param.r);
     let mut acc = na::DVector::zeros(param.m() * param.ell());
 
@@ -229,35 +230,40 @@ pub fn alice_decode(
     acc
 }
 
-pub fn bob_decode(
+pub fn bob_decode<S: Scalar>(
     param: NIOTEparam,
-    pk: &NIOTEpk,
-    d_vec: na::DVectorView<Wrapping<u64>>,
-    phi: na::DVectorView<Wrapping<u64>>,
-) -> na::DVector<Wrapping<u64>> {
+    pk: &NIOTEpk<S>,
+    d_vec: na::DVectorView<S>,
+    phi: na::DVectorView<S>,
+) -> na::DVector<S> {
     let w_r_minus_1 = half_niote::bob_decode(param.half, &pk.half, d_vec, phi);
     &pk.p_mat_prods[param.r - 1] * w_r_minus_1
 }
 
-pub fn reconstruct(
+pub fn reconstruct<S: Scalar>(
     param: NIOTEparam,
-    v: na::DVectorView<Wrapping<u64>>,
-    w: na::DVectorView<Wrapping<u64>>,
-) -> na::DVector<Wrapping<u64>> {
+    v: na::DVectorView<S>,
+    w: na::DVectorView<S>,
+) -> na::DVector<S> {
     half_niote::reconstruct(param.half, v, w)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::Wrapping;
+
     use rand::SeedableRng;
     use rand_chacha::ChaCha12Rng;
 
     use super::*;
 
-    fn run_protocol(k: usize, t: usize, r: usize, xs: Vec<Wrapping<u64>>, ys: Vec<bool>) {
+    fn run_protocol<S: Scalar>(k: usize, t: usize, r: usize, xs: Vec<S>, ys: Vec<bool>)
+    where
+        rand::distr::StandardUniform: rand::distr::Distribution<S>,
+    {
         // if we only want one instance of hOTE, then we need to ensure that \ell = k \log q
         let ell = ys.len();
-        let log_q = 64;
+        let log_q = S::BIT_LENGTH as u64;
         assert_eq!(ell, k * log_q as usize);
 
         // m = t^r n
@@ -278,7 +284,7 @@ mod tests {
         let x_vec = na::DVector::from_vec(xs);
         let (d_vec, psi) = alice_encode(param, &pk, x_vec.as_view());
 
-        let y_vec = na::DVector::from_vec(ys.into_iter().map(|y| Wrapping(y as u64)).collect());
+        let y_vec = na::DVector::from_vec(ys.into_iter().map(|y| S::from_u64(y as u64)).collect());
         let (e_mats, phi) = bob_encode(param, &pk, y_vec.as_view(), &mut rng);
 
         let v_vec = alice_decode(param, &pk, &e_mats, &psi);
@@ -289,15 +295,16 @@ mod tests {
 
     #[test]
     fn test_protocol() {
+        type MyScalar = Wrapping<u32>;
         let t = 2;
         let r = 1;
         let k = 1; // normally k is big
-        let n = k * 64;
-        run_protocol(
+        let n = k * MyScalar::BIT_LENGTH;
+        run_protocol::<MyScalar>(
             k,
             t,
             r,
-            vec![Wrapping(1u64); t.pow(r as u32) * n],
+            vec![Wrapping(1); t.pow(r as u32) * n],
             vec![true; n],
         );
     }

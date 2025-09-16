@@ -1,19 +1,18 @@
-use std::num::Wrapping;
+use std::fmt::Debug;
 
-use bitvec::{order::Lsb0, view::BitView};
 use nalgebra as na;
 use rand::{CryptoRng, Rng};
 
-use crate::{LazyIdentityKronecker, sample_discrete_gaussian};
+use crate::{LazyIdentityKronecker, Scalar, sample_discrete_gaussian};
 
-pub struct HalfNIOTEpk {
-    pub a_mat: na::DMatrix<Wrapping<u64>>,
-    pub b_mat: na::DMatrix<Wrapping<u64>>,
+pub struct HalfNIOTEpk<S: Scalar> {
+    pub a_mat: na::DMatrix<S>,
+    pub b_mat: na::DMatrix<S>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct HalfNIOTEparam {
-    pub log_q: u64, // fixed to 64
+    pub log_q: u64,
     pub m: usize,
     pub ell: usize,
     pub k: usize, // lwe dim
@@ -45,7 +44,7 @@ impl HalfNIOTEparam {
     }
 }
 
-pub fn setup<R: Rng + CryptoRng>(param: HalfNIOTEparam, _rng: &mut R) -> HalfNIOTEpk {
+pub fn setup<R: Rng + CryptoRng, S: Scalar>(param: HalfNIOTEparam, _rng: &mut R) -> HalfNIOTEpk<S> {
     // let a_mat = na::DMatrix::<bool>::from_distribution_generic(
     //     nalgebra::Dyn(param.n),
     //     nalgebra::Dyn(param.m * param.log_q),
@@ -53,57 +52,50 @@ pub fn setup<R: Rng + CryptoRng>(param: HalfNIOTEparam, _rng: &mut R) -> HalfNIO
     //     rng,
     // );
     let a_mat = na::DMatrix::<bool>::new_random(param.n(), param.m * param.log_q as usize);
-    let a_mat = a_mat.map(|x| if x { Wrapping(1u64) } else { Wrapping(0u64) });
+    let a_mat = a_mat.map(|x| if x { S::one() } else { S::zero() });
 
     let b_mat = na::DMatrix::<bool>::new_random(param.n(), param.m * param.ell * param.n());
-    let b_mat = b_mat.map(|x| if x { Wrapping(1u64) } else { Wrapping(0u64) });
+    let b_mat = b_mat.map(|x| if x { S::one() } else { S::zero() });
 
     HalfNIOTEpk { a_mat, b_mat }
 }
 
-fn bits(x_vec: na::DVectorView<Wrapping<u64>>) -> na::DVector<Wrapping<u64>> {
+fn bits<S: Scalar>(x_vec: na::DVectorView<S>) -> na::DVector<S> {
     let input_len = x_vec.len();
     // bits function
-    let x_vec_hat = x_vec
-        .iter()
-        .flat_map(|x| {
-            x.0.view_bits::<Lsb0>()
-                .to_bitvec()
-                .into_iter()
-                .map(|x| Wrapping(x as u64))
-        })
-        .collect::<Vec<Wrapping<u64>>>();
-    assert_eq!(x_vec_hat.len(), 64 * input_len);
+    let x_vec_hat = x_vec.iter().flat_map(|x| x.view_bits()).collect::<Vec<S>>();
+    assert_eq!(x_vec_hat.len(), S::BIT_LENGTH * input_len);
     na::DVector::from_vec(x_vec_hat)
 }
 
 /// returns (d, psi = x_hat)
-pub fn alice_encode(
-    pk: &HalfNIOTEpk,
-    x_vec: na::DVectorView<Wrapping<u64>>,
-) -> (na::DVector<Wrapping<u64>>, na::DVector<Wrapping<u64>>) {
-    let a_mat: na::DMatrixView<Wrapping<u64>> = pk.a_mat.as_view();
+pub fn alice_encode<S: Scalar>(
+    pk: &HalfNIOTEpk<S>,
+    x_vec: na::DVectorView<S>,
+) -> (na::DVector<S>, na::DVector<S>) {
+    let a_mat: na::DMatrixView<S> = pk.a_mat.as_view();
     let x_vec_hat = bits(x_vec);
-    debug_assert_eq!(x_vec_hat.len(), x_vec.len() * 64);
+    debug_assert_eq!(x_vec_hat.len(), x_vec.len() * S::BIT_LENGTH);
     let d = a_mat * &x_vec_hat;
     (d, x_vec_hat)
 }
 
 // this can be a constant/lazy static
-pub(crate) fn gadget_vec(log_q: u64) -> na::DVector<Wrapping<u64>> {
+pub(crate) fn gadget_vec<S: Scalar>() -> na::DVector<S> {
+    let log_q = S::BIT_LENGTH;
     let mut v = Vec::with_capacity(log_q as usize);
     for i in 0..log_q {
-        v.push(Wrapping(1u64 << i));
+        v.push(S::from_u64(1u64 << i));
     }
     na::DVector::from_vec(v)
 }
 
-fn compute_z(
+fn compute_z<S: Scalar>(
     param: HalfNIOTEparam,
-    pk: &HalfNIOTEpk,
-    s: na::DVectorView<Wrapping<u64>>,
-    g_vec: na::DVectorView<Wrapping<u64>>,
-) -> na::DMatrix<Wrapping<u64>> {
+    pk: &HalfNIOTEpk<S>,
+    s: na::DVectorView<S>,
+    g_vec: na::DVectorView<S>,
+) -> na::DMatrix<S> {
     // let id_ml = na::DMatrix::identity(param.m * param.ell, param.m * param.ell);
     // &pk.b_mat * id_ml.kronecker(&s.kronecker(&g_vec))
     // NOTE: compared to the above, we have about −96.639% improvement
@@ -121,16 +113,19 @@ fn compute_z(
 // }
 
 // returns (c, phi=s)
-pub fn bob_encode(
+pub fn bob_encode<S: Scalar>(
     param: HalfNIOTEparam,
-    pk: &HalfNIOTEpk,
-    y_vec: na::DVectorView<Wrapping<u64>>,
+    pk: &HalfNIOTEpk<S>,
+    y_vec: na::DVectorView<S>,
     rng: &mut (impl Rng + CryptoRng),
-) -> (na::DMatrix<Wrapping<u64>>, na::DVector<Wrapping<u64>>) {
+) -> (na::DMatrix<S>, na::DVector<S>)
+where
+    rand::distr::StandardUniform: rand::distr::Distribution<S>,
+{
     // B * (I_{m \ell} \otimes s \otimes g^T_q)
-    let s_vec = na::DVector::<Wrapping<u64>>::new_random(param.k);
+    let s_vec = na::DVector::<S>::new_random(param.k);
     debug_assert_eq!(s_vec.shape(), (param.k, 1)); // This means it is a column matrix
-    let g_vec = gadget_vec(param.log_q);
+    let g_vec = gadget_vec::<S>();
     debug_assert_eq!(
         pk.b_mat.shape(),
         (param.n(), param.m * param.ell * param.n())
@@ -139,7 +134,7 @@ pub fn bob_encode(
     debug_assert_eq!(z.shape(), (param.n(), param.m * param.ell));
 
     // I_m \otimes (y * q/2)^T \otimes g^T_q
-    let delta = Wrapping(1u64 << (param.log_q - 1)); // q/2
+    let delta = S::from_u64(1u64 << (param.log_q - 1)); // q/2
     let y_delta_vec = y_vec * delta;
 
     // let z_prime = compute_z_prime(param, y_delta_vec.as_view(), g_vec.as_view());
@@ -152,8 +147,9 @@ pub fn bob_encode(
     );
 
     // errors
-    let e_prime = sample_discrete_gaussian(rng, param.stddev, param.n(), param.m * param.ell);
-    let e_tilde = sample_discrete_gaussian(
+    let e_prime =
+        sample_discrete_gaussian::<_, S>(rng, param.stddev, param.n(), param.m * param.ell);
+    let e_tilde = sample_discrete_gaussian::<_, S>(
         rng,
         param.stddev,
         param.m * param.log_q as usize,
@@ -173,43 +169,48 @@ pub fn bob_encode(
 }
 
 // returns v = C^T * x_hat
-pub fn alice_decode(
-    c_mat: na::DMatrixView<Wrapping<u64>>,
-    psi: na::DVectorView<Wrapping<u64>>,
-) -> na::DVector<Wrapping<u64>> {
+pub fn alice_decode<S: Scalar>(
+    c_mat: na::DMatrixView<S>,
+    psi: na::DVectorView<S>,
+) -> na::DVector<S> {
     let x_vec_hat = psi;
     c_mat.transpose() * x_vec_hat
 }
 
 // returns w = - (I_{m \ell} \otimes s^T \otimes g_q) * B^T * d
-pub fn bob_decode(
+pub fn bob_decode<S: Scalar>(
     param: HalfNIOTEparam,
-    pk: &HalfNIOTEpk,
-    d_vec: na::DVectorView<Wrapping<u64>>,
-    phi: na::DVectorView<Wrapping<u64>>,
-) -> na::DVector<Wrapping<u64>> {
+    pk: &HalfNIOTEpk<S>,
+    d_vec: na::DVectorView<S>,
+    phi: na::DVectorView<S>,
+) -> na::DVector<S> {
     let id_ml = na::DMatrix::identity(param.m * param.ell, param.m * param.ell);
     let s = phi;
-    let g_vec_t = gadget_vec(param.log_q).transpose();
+    let g_vec_t = gadget_vec::<S>().transpose();
 
-    // d =
-    -(id_ml.kronecker(&s.transpose().kronecker(&g_vec_t)) * pk.b_mat.transpose() * d_vec)
+    // output d, note that this is not negated, we negate during reconstruction
+    id_ml.kronecker(&s.transpose().kronecker(&g_vec_t)) * pk.b_mat.transpose() * d_vec
 }
 
-pub fn reconstruct(
+pub fn reconstruct<S: Scalar>(
     param: HalfNIOTEparam,
-    v: na::DVectorView<Wrapping<u64>>,
-    w: na::DVectorView<Wrapping<u64>>,
-) -> na::DVector<Wrapping<u64>> {
-    (v + w).map(|x| {
+    v: na::DVectorView<S>,
+    w: na::DVectorView<S>,
+) -> na::DVector<S> {
+    (v - w).map(|x| {
         // we need to divide by q/2 and round
         // this is basically the same as shift right by 63
-        Wrapping(x.0 >> (param.log_q - 1))
+        //
+        // we don't have shl or shr implemented for Scalar
+        // so manually convert to and from u64 to shift
+        S::from_u64(x.as_u64() >> (param.log_q - 1))
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::Wrapping;
+
     use proptest::{
         arbitrary::{StrategyFor, arbitrary_with},
         prelude::*,
@@ -231,13 +232,16 @@ mod tests {
     proptest! {
         #[test]
         fn test_protocol(xs in gen_vec_wrapping(4), ys in gen_bool(2)) {
-            run_protocol(xs, ys);
+            run_protocol::<Wrapping<u64>>(xs, ys);
         }
     }
 
-    fn run_protocol(xs: Vec<Wrapping<u64>>, ys: Vec<bool>) {
+    fn run_protocol<S: Scalar>(xs: Vec<S>, ys: Vec<bool>)
+    where
+        rand::distr::StandardUniform: rand::distr::Distribution<S>,
+    {
         let param = HalfNIOTEparam {
-            log_q: 64,
+            log_q: S::BIT_LENGTH as u64,
             m: xs.len(),
             ell: ys.len(),
             k: 2,
@@ -249,9 +253,9 @@ mod tests {
         let pk = setup(param, &mut rng);
 
         let x_vec = na::DVector::from_vec(xs);
-        let (d, psi) = alice_encode(&pk, x_vec.as_view());
+        let (d, psi) = alice_encode::<S>(&pk, x_vec.as_view());
 
-        let y_vec = na::DVector::from_vec(ys.into_iter().map(|y| Wrapping(y as u64)).collect());
+        let y_vec = na::DVector::from_vec(ys.into_iter().map(|y| S::from_u64(y as u64)).collect());
         let (c, phi) = bob_encode(param, &pk, y_vec.as_view(), &mut rng);
         assert_eq!(phi.shape(), (param.k, 1));
 
@@ -271,7 +275,7 @@ mod tests {
         assert_eq!(v.shape(), res.shape());
 
         // round(v + m)_p = x \otimes y mod p
-        let expected = x_vec.kronecker(&y_vec).map(|x| Wrapping(x.0 % 2));
+        let expected = x_vec.kronecker(&y_vec).map(|x| S::from_u64(x.as_u64() % 2));
         assert_eq!(res, expected);
     }
 }

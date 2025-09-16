@@ -1,14 +1,97 @@
 use std::{
+    fmt::Debug,
     num::Wrapping,
-    ops::{Add, Index, Mul},
+    ops::{Add, AddAssign, Index, Mul, MulAssign, Neg, Sub, SubAssign},
 };
 
+use bitvec::{order::Lsb0, view::BitView};
 use itertools::izip;
 use nalgebra as na;
+use num_traits::Unsigned;
 use rand::{CryptoRng, Rng, distr::Distribution};
 
 pub mod full_niote;
 pub mod half_niote;
+
+pub trait Scalar:
+    Unsigned
+    + Copy
+    + Clone
+    + Debug
+    + Add
+    + Mul
+    + Sub
+    + AddAssign
+    + MulAssign
+    + SubAssign
+    + Neg
+    + 'static
+{
+    const BIT_LENGTH: usize;
+    fn from_u64(x: u64) -> Self;
+    fn as_u64(&self) -> u64;
+    fn view_bits(&self) -> impl Iterator<Item = Self>;
+}
+
+impl Scalar for Wrapping<u64> {
+    const BIT_LENGTH: usize = 64;
+
+    fn from_u64(x: u64) -> Self {
+        Self(x)
+    }
+
+    fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    fn view_bits(&self) -> impl Iterator<Item = Self> {
+        self.0
+            .view_bits::<Lsb0>()
+            .to_bitvec()
+            .into_iter()
+            .map(|x| if x { Wrapping(1) } else { Wrapping(0) })
+    }
+}
+
+impl Scalar for Wrapping<u32> {
+    const BIT_LENGTH: usize = 32;
+
+    fn from_u64(x: u64) -> Self {
+        Self(x as u32)
+    }
+
+    fn as_u64(&self) -> u64 {
+        self.0 as u64
+    }
+
+    fn view_bits(&self) -> impl Iterator<Item = Self> {
+        self.0
+            .view_bits::<Lsb0>()
+            .to_bitvec()
+            .into_iter()
+            .map(|x| if x { Wrapping(1) } else { Wrapping(0) })
+    }
+}
+
+impl Scalar for Wrapping<u16> {
+    const BIT_LENGTH: usize = 16;
+
+    fn from_u64(x: u64) -> Self {
+        Self(x as u16)
+    }
+
+    fn as_u64(&self) -> u64 {
+        self.0 as u64
+    }
+
+    fn view_bits(&self) -> impl Iterator<Item = Self> {
+        self.0
+            .view_bits::<Lsb0>()
+            .to_bitvec()
+            .into_iter()
+            .map(|x| if x { Wrapping(1) } else { Wrapping(0) })
+    }
+}
 
 pub struct UniformRandom;
 
@@ -29,26 +112,32 @@ impl Distribution<bool> for UniformRandomBool {
 }
 
 // TODO write proper sampling
-pub fn sample_discrete_gaussian<R: Rng + CryptoRng>(
+pub fn sample_discrete_gaussian<R: Rng + CryptoRng, S: Scalar>(
     _rng: &mut R,
     _stddev: f64,
     nrows: usize,
     mcols: usize,
-) -> na::DMatrix<Wrapping<u64>> {
+) -> na::DMatrix<S> {
     na::DMatrix::zeros(nrows, mcols)
 }
 
 /// This is the result of a kronecker product
 /// between an identity matrix and another matrix.
 /// We do not perform the actual kronecker product.
-pub(crate) struct LazyIdentityKronecker<'a> {
+pub(crate) struct LazyIdentityKronecker<'a, S: Scalar> {
     id_dim: usize,
-    view: na::DMatrixView<'a, Wrapping<u64>>,
+    view: na::DMatrixView<'a, S>,
+    // we need to keep a value here so that we can return its reference
+    zero: S,
 }
 
-impl<'a> LazyIdentityKronecker<'a> {
-    pub(crate) fn new(id_dim: usize, view: na::DMatrixView<'a, Wrapping<u64>>) -> Self {
-        Self { id_dim, view }
+impl<'a, S: Scalar> LazyIdentityKronecker<'a, S> {
+    pub(crate) fn new(id_dim: usize, view: na::DMatrixView<'a, S>) -> Self {
+        Self {
+            id_dim,
+            view,
+            zero: S::zero(),
+        }
     }
 
     pub(crate) fn shape(&self) -> (usize, usize) {
@@ -60,19 +149,19 @@ impl<'a> LazyIdentityKronecker<'a> {
         self.view.shape()
     }
 
-    pub(crate) fn internal(&'a self) -> na::DMatrixView<'a, Wrapping<u64>> {
+    pub(crate) fn internal(&'a self) -> na::DMatrixView<'a, S> {
         self.view.as_view()
     }
 }
 
-impl<'a> Index<(usize, usize)> for LazyIdentityKronecker<'a> {
-    type Output = Wrapping<u64>;
+impl<'a, S: Scalar> Index<(usize, usize)> for LazyIdentityKronecker<'a, S> {
+    type Output = S;
 
     fn index(&self, (i, j): (usize, usize)) -> &Self::Output {
         let i_factor = i / self.view.shape().0;
         let j_factor = j / self.view.shape().1;
         if i_factor != j_factor {
-            &Wrapping(0)
+            &self.zero
         } else {
             // index i, j of the concrete matrix
             let i = i % self.view.shape().0;
@@ -82,42 +171,43 @@ impl<'a> Index<(usize, usize)> for LazyIdentityKronecker<'a> {
     }
 }
 
-impl<'a> Add<&LazyIdentityKronecker<'a>> for na::DMatrixView<'_, Wrapping<u64>> {
-    type Output = na::DMatrix<Wrapping<u64>>;
+impl<'a, S: Scalar> Add<&LazyIdentityKronecker<'a, S>> for na::DMatrixView<'_, S> {
+    type Output = na::DMatrix<S>;
 
-    fn add(self, rhs: &LazyIdentityKronecker<'a>) -> Self::Output {
-        let mut out = na::DMatrix::<Wrapping<u64>>::zeros(self.shape().0, self.shape().1);
+    fn add(self, rhs: &LazyIdentityKronecker<'a, S>) -> Self::Output {
+        let mut out = na::DMatrix::<S>::zeros(self.shape().0, self.shape().1);
         izip!(out.row_iter_mut(), self.row_iter())
             .enumerate()
             .for_each(|(i, (mut out_rows, a_rows))| {
                 izip!(out_rows.iter_mut(), a_rows.iter())
                     .enumerate()
                     .for_each(|(j, (out, a_val))| {
-                        *out = a_val + rhs[(i, j)];
+                        // somehow we cannot use the operator
+                        *out = a_val.add(rhs[(i, j)]);
                     })
             });
         out
     }
 }
 
-impl<'a> Add<LazyIdentityKronecker<'a>> for na::DMatrixView<'_, Wrapping<u64>> {
-    type Output = na::DMatrix<Wrapping<u64>>;
-    fn add(self, rhs: LazyIdentityKronecker<'a>) -> Self::Output {
+impl<'a, S: Scalar> Add<LazyIdentityKronecker<'a, S>> for na::DMatrixView<'_, S> {
+    type Output = na::DMatrix<S>;
+    fn add(self, rhs: LazyIdentityKronecker<'a, S>) -> Self::Output {
         self + &rhs
     }
 }
 
-impl<'a> Mul<&LazyIdentityKronecker<'a>> for na::DMatrixView<'_, Wrapping<u64>> {
-    type Output = na::DMatrix<Wrapping<u64>>;
+impl<'a, S: Scalar> Mul<&LazyIdentityKronecker<'a, S>> for na::DMatrixView<'_, S> {
+    type Output = na::DMatrix<S>;
 
-    fn mul(self, rhs: &LazyIdentityKronecker<'a>) -> Self::Output {
+    fn mul(self, rhs: &LazyIdentityKronecker<'a, S>) -> Self::Output {
         // compute A * B
         let a_mat = self;
         let b_mat = rhs;
 
         assert_eq!(a_mat.shape().1, b_mat.shape().0);
 
-        let mut out = na::DMatrix::<Wrapping<u64>>::zeros(a_mat.shape().0, b_mat.shape().1);
+        let mut out = na::DMatrix::<S>::zeros(a_mat.shape().0, b_mat.shape().1);
 
         // iterate over rows
         for i in 0..a_mat.shape().0 {
@@ -142,10 +232,10 @@ impl<'a> Mul<&LazyIdentityKronecker<'a>> for na::DMatrixView<'_, Wrapping<u64>> 
     }
 }
 
-impl<'a> Mul<LazyIdentityKronecker<'a>> for na::DMatrixView<'_, Wrapping<u64>> {
-    type Output = na::DMatrix<Wrapping<u64>>;
+impl<'a, S: Scalar> Mul<LazyIdentityKronecker<'a, S>> for na::DMatrixView<'_, S> {
+    type Output = na::DMatrix<S>;
 
-    fn mul(self, rhs: LazyIdentityKronecker<'a>) -> Self::Output {
+    fn mul(self, rhs: LazyIdentityKronecker<'a, S>) -> Self::Output {
         self * &rhs
     }
 }
@@ -157,7 +247,7 @@ mod tests {
     #[test]
     fn test_lazy_kronecker_mul() {
         let id_dim = 10;
-        let v = na::DVector::new_random(5);
+        let v: na::DVector<Wrapping<u64>> = na::DVector::new_random(5);
 
         let lazy_mat = LazyIdentityKronecker::new(id_dim, v.as_view());
         assert_eq!(lazy_mat.shape(), (v.shape().0 * id_dim, id_dim));

@@ -451,6 +451,7 @@ dependencies = [
  "criterion",
  "itertools 0.14.0",
  "nalgebra",
+ "num-traits",
  "proptest",
  "rand",
  "rand_chacha",
