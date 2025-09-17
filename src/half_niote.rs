@@ -221,7 +221,7 @@ mod tests {
 
     use super::*;
 
-    fn gen_vec_wrapping(m: usize) -> StrategyFor<Vec<Wrapping<u64>>> {
+    fn gen_vec_wrapping(m: usize) -> StrategyFor<Vec<Wrapping<u16>>> {
         arbitrary_with(size_range(m).lift())
     }
 
@@ -232,7 +232,7 @@ mod tests {
     proptest! {
         #[test]
         fn test_protocol(xs in gen_vec_wrapping(4), ys in gen_bool(2)) {
-            run_protocol::<Wrapping<u64>>(xs, ys);
+            run_protocol::<Wrapping<u16>>(xs, ys);
         }
     }
 
@@ -247,7 +247,7 @@ mod tests {
             k: 2,
             stddev: 3.2,
         };
-        println!("[test] half niote with param: {param:?}");
+        // println!("[test] half niote with param: {param:?}");
 
         let mut rng = ChaCha12Rng::from_os_rng();
 

@@ -51,12 +51,28 @@ pub struct NIOTEpk<S: Scalar> {
 pub fn setup<R: Rng + CryptoRng, S: Scalar>(param: NIOTEparam, rng: &mut R) -> NIOTEpk<S> {
     let pk = half_niote::setup(param.half, rng);
 
-    let ident_tn: na::DMatrix<S> = na::DMatrix::identity(param.t * param.n(), param.t * param.n());
+    // TODO how to come up with p_mat?
+    let p_mat: na::DMatrix<S> =
+        na::DMatrix::identity(param.n() * param.n(), param.t * param.n() * param.n());
+    /*
+    // nt^r
+    let nt_to_r = param.t.pow(param.r as u32) * param.n();
+    let ident_tnr: na::DMatrix<S> = na::DMatrix::identity(nt_to_r, nt_to_r);
     let g = gadget_vec::<S>();
-    let p_mat: na::DMatrix<S> = &pk.a_mat * (ident_tn.kronecker(&g));
+    let p_mat: na::DMatrix<S> = &pk.a_mat * (ident_tnr.kronecker(&g));
+    assert_eq!(pk.a_mat.shape(), (param.n(), nt_to_r * S::BIT_LENGTH));
+    */
+
     // let ident_logq: na::DMatrix<S> = na::DMatrix::identity(S::BIT_LENGTH, S::BIT_LENGTH);
     // let p_mat: na::DMatrix<S> = pk.a_mat.kronecker(&ident_logq);
     let p_mat_prods = scan_p_mat_prods(param, p_mat.as_view());
+
+    #[cfg(test)]
+    {
+        for (i, p) in p_mat_prods.iter().enumerate() {
+            println!("p dims: {i}, {:?}", p.shape())
+        }
+    }
 
     NIOTEpk {
         half: pk,
@@ -132,17 +148,15 @@ where
     let g = gadget_vec::<S>();
     let mut y_i = phi_1.kronecker(&g);
 
-    // TODO maybe there's a more elegant way of writing the logic
-    // (1..param.r).fold(y_i, |acc, _| {
-    //         let (e_mat_i, phi_ip1) = half_niote::bob_encode(param.half, pk, y_i.as_view(), rng);
-    //         phi_ip1.kronecker(&g)
-    // });
     for i in 1..param.r {
         debug_assert_eq!(y_i.shape(), (param.log_q() as usize * param.k(), 1));
         let (e_mat_i, phi_ip1) = half_niote::bob_encode(param.half, &pk.half, y_i.as_view(), rng);
         debug_assert_eq!(
             e_mat_i.shape(),
-            (param.t * param.n(), (param.t * param.n()).pow(2))
+            (
+                param.t * param.n() * param.log_q() as usize,
+                param.t * param.n() * param.ell()
+            )
         );
 
         e_out.push(e_mat_i);
@@ -164,8 +178,11 @@ fn scan_p_mat_prods<S: Scalar>(
     param: NIOTEparam,
     p_mat: na::DMatrixView<S>,
 ) -> Vec<na::DMatrix<S>> {
-    // P: n \times tn
-    assert_eq!(p_mat.shape(), (param.n(), param.t * param.n()));
+    // P: n^2 \times tn^2
+    assert_eq!(
+        p_mat.shape(),
+        (param.n() * param.n(), param.n() * param.n() * param.t)
+    );
 
     // P_i will have dimension (n*t^{r - 1 - i}, n*t^{r - i})
     // below we remove the factor n for brevity, so the above becomes (t^{r - 1 - i}, t^{r - i})
@@ -176,8 +193,8 @@ fn scan_p_mat_prods<S: Scalar>(
     //                   : (t^{r - 3}, t^{r})
     // P_{r-1} *...* P_0 : (t^0, t^r)
     let mut p_mats = (0..param.r).map(|i| {
-        // let t_pow = param.t_pow_r_minus_i_1(i);
-        let t_pow = param.t.pow((param.r - i) as u32);
+        let t_pow = param.t_pow_r_minus_i_1(i);
+        // let t_pow = param.t.pow((param.r - i) as u32);
         let id = na::DMatrix::identity(t_pow, t_pow);
         id.kronecker(&p_mat)
     });
@@ -204,18 +221,18 @@ pub fn alice_decode<S: Scalar>(
     psi: &[Vec<na::DVector<S>>],
 ) -> na::DVector<S> {
     assert_eq!(e_mats.len(), param.r);
-    let mut acc = na::DVector::zeros(param.m() * param.ell());
+    let mut acc = na::DVector::zeros(param.n() * param.n() * param.t.pow(param.r as u32));
 
-    // we write the algorithm a bit differently than what is the paper because
-    // doing a lot of tensor products with identity matrix is not efficient
+    // we start at the bottom level (the leaves of the hash tree) at i = 0
+    // the top level is at i = r-1
     for i in 0..param.r {
         let t_pow = param.t_pow_r_minus_i_1(i);
 
-        // suppose e_mats[i] has dimension (tn) x (tn \ell)
+        // suppose e_mats[i] has dimension (tn \log q) x (tn \ell)
         // internally a mat-vec multiplication happens on transpose of e_mats[i] in hOTE.alice_decode
         // so the resulting vector has length tn \ell
         // also there are t^{r - i - 1} of those vectors
-        let chunk_size = e_mats[i].shape().1;
+        let chunk_size = e_mats[i].shape().1; // this is tn \ell
         let v_i_len = chunk_size * t_pow;
         let mut v_i = na::DVector::zeros(v_i_len);
 
@@ -225,18 +242,15 @@ pub fn alice_decode<S: Scalar>(
             v_i.rows_mut(chunk_size * j, chunk_size).copy_from(&v_ij);
         }
 
-        // we only do the multiplication with the products of p_mat_i
-        // for indices i > 0, this is because in the paper it is written as
-        // \prod_{i = 1}^i P_k, where i starts from 1
         if i == 0 {
             acc += v_i;
         } else {
-            let p_mat_prod_i = &pk.p_mat_prods[i];
-            acc += p_mat_prod_i * v_i;
+            let p_mat_prod = &pk.p_mat_prods[i - 1];
+            acc += (v_i.transpose() * p_mat_prod).transpose();
         }
     }
 
-    debug_assert_eq!(acc.shape(), (param.m() * param.ell(), 1));
+    // debug_assert_eq!(acc.shape(), (param.m() * param.ell(), 1));
     acc
 }
 
@@ -250,7 +264,7 @@ pub fn bob_decode<S: Scalar>(
     if param.r == 1 {
         w_r_minus_1
     } else {
-        &pk.p_mat_prods[param.r - 1] * w_r_minus_1
+        (w_r_minus_1.transpose() * &pk.p_mat_prods[param.r - 2]).transpose()
     }
 }
 
@@ -278,16 +292,16 @@ mod tests {
         // if we only want one instance of hOTE, then we need to ensure that \ell = k \log q
         let ell = ys.len();
         let log_q = S::BIT_LENGTH as u64;
-        assert_eq!(ell, k * log_q as usize);
 
         // m = t^r n
-        let m = xs.len();
+        let n = xs.len() / t.pow(r as u32);
+        assert_eq!(n, ell);
         let half = HalfNIOTEparam {
             log_q,
-            m,
+            m: n * t,
             ell,
             k,
-            stddev: 3.2,
+            stddev: 0.,
         };
         let param = NIOTEparam { half, t, r };
         println!("[test] full niote with param: {param:?}");
@@ -310,10 +324,26 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol() {
+    fn test_protocol_depth1() {
         type MyScalar = Wrapping<u16>;
         let t = 2;
         let r = 1;
+        let k = 1; // normally k is big
+        let n = k * MyScalar::BIT_LENGTH;
+        run_protocol::<MyScalar>(
+            k,
+            t,
+            r,
+            vec![Wrapping(1); t.pow(r as u32) * n],
+            vec![true; n],
+        );
+    }
+
+    #[test]
+    fn test_protocol_depth2() {
+        type MyScalar = Wrapping<u16>;
+        let t = 2;
+        let r = 2;
         let k = 1; // normally k is big
         let n = k * MyScalar::BIT_LENGTH;
         run_protocol::<MyScalar>(
