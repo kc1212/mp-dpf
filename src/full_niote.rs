@@ -54,6 +54,8 @@ pub fn setup<R: Rng + CryptoRng, S: Scalar>(param: NIOTEparam, rng: &mut R) -> N
     let ident_tn: na::DMatrix<S> = na::DMatrix::identity(param.t * param.n(), param.t * param.n());
     let g = gadget_vec::<S>();
     let p_mat: na::DMatrix<S> = &pk.a_mat * (ident_tn.kronecker(&g));
+    // let ident_logq: na::DMatrix<S> = na::DMatrix::identity(S::BIT_LENGTH, S::BIT_LENGTH);
+    // let p_mat: na::DMatrix<S> = pk.a_mat.kronecker(&ident_logq);
     let p_mat_prods = scan_p_mat_prods(param, p_mat.as_view());
 
     NIOTEpk {
@@ -167,13 +169,15 @@ fn scan_p_mat_prods<S: Scalar>(
 
     // P_i will have dimension (n*t^{r - 1 - i}, n*t^{r - i})
     // below we remove the factor n for brevity, so the above becomes (t^{r - 1 - i}, t^{r - i})
-    // P_1 * P_0         : (t^{r - 2}, t^{r - 1}) * (t^{r - 1}, n*t^{r})
+    // P_0               : (t^{r - 1}, t^r)
+    // P_1 * P_0         : (t^{r - 2}, t^{r - 1}) * (t^{r - 1}, t^{r})
     //                   : (t^{r - 2}, t^{r})
     // P_2 * P_1 * P_0   : (t^{r - 3}, t^{r - 2}), (t^{r - 2}, t^{r})
     //                   : (t^{r - 3}, t^{r})
     // P_{r-1} *...* P_0 : (t^0, t^r)
     let mut p_mats = (0..param.r).map(|i| {
-        let t_pow = param.t_pow_r_minus_i_1(i);
+        // let t_pow = param.t_pow_r_minus_i_1(i);
+        let t_pow = param.t.pow((param.r - i) as u32);
         let id = na::DMatrix::identity(t_pow, t_pow);
         id.kronecker(&p_mat)
     });
@@ -207,10 +211,9 @@ pub fn alice_decode<S: Scalar>(
     for i in 0..param.r {
         let t_pow = param.t_pow_r_minus_i_1(i);
 
-        // note: the length of e_mats[0] is different from the rest
-        // suppose e_mats[i] has dimension (tn) x (tn \ell_i)
-        // internally a mat-vec multiplication happens on transpose of e_mats[i]
-        // so the resulting vector has length tn \ell_i
+        // suppose e_mats[i] has dimension (tn) x (tn \ell)
+        // internally a mat-vec multiplication happens on transpose of e_mats[i] in hOTE.alice_decode
+        // so the resulting vector has length tn \ell
         // also there are t^{r - i - 1} of those vectors
         let chunk_size = e_mats[i].shape().1;
         let v_i_len = chunk_size * t_pow;
@@ -222,8 +225,15 @@ pub fn alice_decode<S: Scalar>(
             v_i.rows_mut(chunk_size * j, chunk_size).copy_from(&v_ij);
         }
 
-        let p_mat_prod_i = &pk.p_mat_prods[i];
-        acc += p_mat_prod_i * v_i;
+        // we only do the multiplication with the products of p_mat_i
+        // for indices i > 0, this is because in the paper it is written as
+        // \prod_{i = 1}^i P_k, where i starts from 1
+        if i == 0 {
+            acc += v_i;
+        } else {
+            let p_mat_prod_i = &pk.p_mat_prods[i];
+            acc += p_mat_prod_i * v_i;
+        }
     }
 
     debug_assert_eq!(acc.shape(), (param.m() * param.ell(), 1));
@@ -237,7 +247,11 @@ pub fn bob_decode<S: Scalar>(
     phi: na::DVectorView<S>,
 ) -> na::DVector<S> {
     let w_r_minus_1 = half_niote::bob_decode(param.half, &pk.half, d_vec, phi);
-    &pk.p_mat_prods[param.r - 1] * w_r_minus_1
+    if param.r == 1 {
+        w_r_minus_1
+    } else {
+        &pk.p_mat_prods[param.r - 1] * w_r_minus_1
+    }
 }
 
 pub fn reconstruct<S: Scalar>(
@@ -276,7 +290,7 @@ mod tests {
             stddev: 3.2,
         };
         let param = NIOTEparam { half, t, r };
-        println!("starting full niote with param {param:?}");
+        println!("[test] full niote with param: {param:?}");
 
         let mut rng = ChaCha12Rng::from_os_rng();
         let pk = setup(param, &mut rng);
@@ -290,12 +304,14 @@ mod tests {
         let v_vec = alice_decode(param, &pk, &e_mats, &psi);
         let w_vec = bob_decode(param, &pk, d_vec.as_view(), phi.as_view());
 
-        let _z = reconstruct(param, v_vec.as_view(), w_vec.as_view());
+        let actual = reconstruct(param, v_vec.as_view(), w_vec.as_view());
+        let expected = x_vec.kronecker(&y_vec).map(|x| S::from_u64(x.as_u64() % 2));
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn test_protocol() {
-        type MyScalar = Wrapping<u32>;
+        type MyScalar = Wrapping<u16>;
         let t = 2;
         let r = 1;
         let k = 1; // normally k is big

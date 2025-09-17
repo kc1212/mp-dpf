@@ -247,6 +247,7 @@ mod tests {
             k: 2,
             stddev: 3.2,
         };
+        println!("[test] half niote with param: {param:?}");
 
         let mut rng = ChaCha12Rng::from_os_rng();
 
@@ -271,11 +272,11 @@ mod tests {
         assert_eq!(v.shape(), (param.m * param.ell, 1));
         assert_eq!(v.shape(), w.shape());
 
-        let res = reconstruct(param, v.as_view(), w.as_view());
-        assert_eq!(v.shape(), res.shape());
+        let actual = reconstruct(param, v.as_view(), w.as_view());
+        assert_eq!(v.shape(), actual.shape());
 
         // round(v + m)_p = x \otimes y mod p
         let expected = x_vec.kronecker(&y_vec).map(|x| S::from_u64(x.as_u64() % 2));
-        assert_eq!(res, expected);
+        assert_eq!(actual, expected);
     }
 }
