@@ -82,6 +82,28 @@ impl NIOTEparam {
         self.n() * self.log_q() as usize * self.n()
     }
 
+    /// log2 of an upper bound on the probability that v + w != x \otimes y (mod p) (Theorem 4),
+    /// using a union bound over all local roundings (Lemma 5) and
+    /// all liftings (Corollary 2 with B = 1, i.e., 2/p per coordinate).
+    pub fn log2_failure_bound(&self) -> f64 {
+        let leaf = self.leaf_param();
+        let inner = self.inner_param();
+        // number of output coordinates of hOTE_n over the root and the inner levels
+        let inner_coords =
+            (0..self.r - 1).map(|j| self.blocks(j)).sum::<usize>() as f64 * inner.out_len() as f64;
+        let leaf_coords = (self.blocks(self.r - 1) * leaf.out_len()) as f64;
+
+        let rounding = inner_coords * inner.coord_rounding_failure()
+            + leaf_coords * leaf.coord_rounding_failure();
+        // lifting is exact when p = q
+        let lifting = if self.moduli.log_p == self.moduli.log_q {
+            0.0
+        } else {
+            inner_coords * 2f64.powi(1 - self.moduli.log_p as i32)
+        };
+        (rounding + lifting).min(1.0).log2()
+    }
+
     /// Total number of ring elements in the encoding E = (E_0, ..., E_{r-1}).
     pub fn encoding_len(&self) -> usize {
         let leaf = self.leaf_param();
@@ -302,7 +324,7 @@ mod tests {
     use rand_chacha::ChaCha12Rng;
 
     use super::*;
-    use crate::ring::sample_vec;
+    use crate::ring::{centered, sample_vec};
 
     // keep every test well below this many bytes for the encoding and the public key
     const MEM_BUDGET: usize = 128 << 20;
@@ -310,6 +332,7 @@ mod tests {
     fn run_protocol<R: Ring>(param: NIOTEparam) {
         let mem = (param.encoding_len() + param.pk_len()) * size_of::<R>();
         assert!(mem < MEM_BUDGET, "{param:?} needs about {} MiB", mem >> 20);
+        assert_eq!(param.log2_failure_bound(), f64::NEG_INFINITY);
 
         let mut rng = ChaCha12Rng::seed_from_u64(3);
         let moduli = param.moduli;
@@ -346,14 +369,15 @@ mod tests {
             t,
             r,
             ell,
-            stddev: 3.2,
+            stddev: 0.0,
         }
     }
 
-    // NOTE: the tests use p = q. Without noise the protocol is then exact and
-    // rounding/lifting are the identity. For p < q, rounding and lifting fail with
-    // probability about 1/Delta and 1/p per coordinate, which requires a large log_q
-    // and makes the encoding too large for a unit test.
+    // NOTE: the tests use p = q and no noise, the protocol is then exact and
+    // rounding/lifting are the identity. With noise or p < q, local rounding and lifting
+    // fail with probability about (||e|| + 1)/Delta and 2/p per coordinate
+    // (see `log2_failure_bound`), which requires a large log_q and makes the encodings
+    // too large for a unit test.
 
     #[test]
     fn test_protocol_u8_deep() {
@@ -379,5 +403,71 @@ mod tests {
     #[test]
     fn test_protocol_u64_k2() {
         run_protocol::<Wrapping<u64>>(param(10, 10, 2, 2, 2, 4));
+    }
+
+    /// One decoding step of Figure 14 with noise, i.e., the induction step of Lemma 9:
+    /// given lifted shares of Bits(h) \otimes Bits(s) from the parent level, the parties
+    /// locally compute round(De_A^raw + P * v_hat) and round(P * w_hat), which must be
+    /// shares of x \otimes y. A whole tree with noise is too large to test, see
+    /// `examples/params.rs`.
+    fn check_level_with_noise<R: Ring>(moduli: Moduli, m: usize, ell: usize, binary_input: bool) {
+        let param = HalfNIOTEparam {
+            moduli,
+            m,
+            ell,
+            k: 1,
+            stddev: 3.2,
+            binary_input,
+        };
+        let tensor_len = param.n() * moduli.log_q as usize * param.k * moduli.log_q as usize;
+        let lift_failure = tensor_len as f64 * 2f64.powi(1 - moduli.log_p as i32);
+        assert!(param.log2_rounding_failure() < -20.0 && lift_failure.log2() < -20.0);
+
+        let mut rng = ChaCha12Rng::seed_from_u64(6);
+        let x_vec = if binary_input {
+            na::DVector::from_fn(m, |_, _| R::from_bool(rng.random()))
+        } else {
+            sample_vec::<R, _>(m, &mut rng).map(|x| x.low_bits(moduli.log_p))
+        };
+        let y_vec = sample_vec::<R, _>(ell, &mut rng).map(|x| x.low_bits(moduli.log_p));
+
+        let pk = half_niote::setup::<R>(param, &mut rng);
+        let prf = Prf::new(&mut rng);
+        let (h, psi) = half_niote::alice_encode(param, &pk, x_vec.as_view());
+        let (c_mat, s) = half_niote::bob_encode(param, &pk, y_vec.as_view(), &mut rng);
+
+        // the parent level outputs Z_p shares of Bits(h) \otimes Bits(s), which are lifted
+        let tensor = bits(h.as_view(), moduli.log_q).kronecker(&bits(s.as_view(), moduli.log_q));
+        assert_eq!(tensor.len(), tensor_len);
+        let t0 = sample_vec::<R, _>(tensor_len, &mut rng).map(|x| x.low_bits(moduli.log_p));
+        let t1 = (&tensor - &t0).map(|x| x.low_bits(moduli.log_p));
+        let v_hat = prf.lift_vec(moduli, 1, Party::Alice, t0.as_view());
+        let w_hat = prf.lift_vec(moduli, 1, Party::Bob, t1.as_view());
+        assert_eq!((&v_hat + &w_hat).map(|x| x.low_bits(moduli.log_q)), tensor);
+
+        let v_raw = half_niote::alice_decode_raw(c_mat.as_view(), psi.as_view())
+            + half_niote::apply_p(param, &pk, v_hat.as_view());
+        let w_raw = half_niote::apply_p(param, &pk, w_hat.as_view());
+
+        // the noise is the same as for the half-succinct NIOTE
+        let e = &v_raw + &w_raw - x_vec.kronecker(&y_vec) * moduli.delta::<R>();
+        assert!(e.iter().any(|x| *x != R::zero()));
+        assert!(
+            e.iter()
+                .all(|x| centered(*x, moduli.log_q).unsigned_abs() <= param.error_bound())
+        );
+
+        let v = moduli.round_vec(v_raw.as_view());
+        let w = moduli.round_vec(w_raw.as_view());
+        let z = moduli.reduce_p_vec((v + w).as_view());
+        assert_eq!(z, x_vec.kronecker(&y_vec).map(|x| x.low_bits(moduli.log_p)));
+    }
+
+    #[test]
+    fn test_level_with_noise() {
+        for binary_input in [false, true] {
+            check_level_with_noise::<Wrapping<u128>>(Moduli::new(100, 50), 2, 3, binary_input);
+            check_level_with_noise::<Wrapping<u128>>(Moduli::new(90, 45), 3, 2, binary_input);
+        }
     }
 }

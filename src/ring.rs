@@ -41,6 +41,12 @@ pub trait Ring:
 
     fn from_bool(b: bool) -> Self;
 
+    /// x mod 2^BITS
+    fn from_u64(x: u64) -> Self;
+
+    /// The canonical representative in [0, 2^BITS).
+    fn to_u128(self) -> u128;
+
     /// Uniformly random element of Z_{2^BITS}.
     fn sample<Rn: Rng + ?Sized>(rng: &mut Rn) -> Self;
 }
@@ -72,6 +78,14 @@ macro_rules! impl_ring {
 
             fn from_bool(b: bool) -> Self {
                 Wrapping(b as $t)
+            }
+
+            fn from_u64(x: u64) -> Self {
+                Wrapping(x as $t)
+            }
+
+            fn to_u128(self) -> u128 {
+                self.0 as u128
             }
 
             fn sample<Rn: Rng + ?Sized>(rng: &mut Rn) -> Self {
@@ -188,6 +202,16 @@ impl Prf {
                 .zip(masks)
                 .map(|(x, mask)| moduli.lift(*x, mask, party)),
         )
+    }
+}
+
+/// The centered representative of x mod 2^log_q in (-2^{log_q - 1}, 2^{log_q - 1}].
+pub fn centered<R: Ring>(x: R, log_q: u32) -> i128 {
+    let x = x.low_bits(log_q);
+    if x > R::pow2(log_q - 1) {
+        -((-x).low_bits(log_q).to_u128() as i128)
+    } else {
+        x.to_u128() as i128
     }
 }
 

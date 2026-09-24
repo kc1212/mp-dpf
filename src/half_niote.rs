@@ -4,7 +4,10 @@
 use nalgebra as na;
 use rand::{CryptoRng, Rng};
 
-use crate::ring::{Moduli, Ring, bits, compose, sample_binary_mat, sample_mat, sample_vec};
+use crate::{
+    noise::{DiscreteGaussian, noise_bound},
+    ring::{Moduli, Ring, bits, compose, sample_binary_mat, sample_mat, sample_vec},
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct HalfNIOTEparam {
@@ -15,12 +18,13 @@ pub struct HalfNIOTEparam {
     pub ell: usize,
     // lwe dim
     pub k: usize,
+    // standard deviation of the noise distribution chi, 0 means no noise
+    pub stddev: f64,
     // If set, Alice's input must be binary and it is hashed directly,
     // instead of hashing its bit decomposition.
     // This is used for the inner levels of the succinct NIOTE,
     // where Alice's input is already a bit decomposition of digests.
     pub binary_input: bool,
-    pub stddev: f64,
 }
 
 impl HalfNIOTEparam {
@@ -51,6 +55,30 @@ impl HalfNIOTEparam {
     pub fn out_len(&self) -> usize {
         self.m * self.ell
     }
+
+    /// Bound on ||v + w - Delta * (x \otimes y)||_inf for the raw shares (Lemma 5),
+    /// i.e., (n + 1) * m_bits * B where B bounds the entries of E' and \tilde{E}.
+    pub fn error_bound(&self) -> u128 {
+        (self.n() as u128 + 1) * self.m_bits() as u128 * noise_bound(self.stddev) as u128
+    }
+
+    /// Bound on the probability that local rounding fails for one output coordinate,
+    /// i.e., (||e||_inf + 1) * p / q (Lemma 5).
+    pub fn coord_rounding_failure(&self) -> f64 {
+        let e = self.error_bound();
+        if self.moduli.log_p == self.moduli.log_q {
+            // no rounding happens, so any noise is an error
+            return if e == 0 { 0.0 } else { 1.0 };
+        }
+        let log_delta = (self.moduli.log_q - self.moduli.log_p) as i32;
+        ((e + 1) as f64 * 2f64.powi(-log_delta)).min(1.0)
+    }
+
+    /// log2 of the union bound on the probability that local rounding fails
+    /// for at least one output coordinate.
+    pub fn log2_rounding_failure(&self) -> f64 {
+        (self.out_len() as f64 * self.coord_rounding_failure()).log2()
+    }
 }
 
 pub struct HalfNIOTEpk<R: Ring> {
@@ -66,10 +94,6 @@ pub fn setup<R: Ring>(param: HalfNIOTEparam, rng: &mut (impl Rng + CryptoRng)) -
     let b_mat = sample_mat(param.n(), param.out_len() * param.k, rng);
     HalfNIOTEpk { a_mat, b_mat }
 }
-
-// TODO sample from a discrete Gaussian with standard deviation `stddev`,
-// the noise is zero for now since we only care about correctness.
-fn add_noise<R: Ring>(_mat: &mut na::DMatrix<R>, _stddev: f64, _rng: &mut (impl Rng + CryptoRng)) {}
 
 /// returns (d = A * x_hat, psi = x_hat)
 pub fn alice_encode<R: Ring>(
@@ -114,12 +138,15 @@ pub fn bob_encode<R: Ring>(
     assert_eq!(y_vec.len(), param.ell);
     let s_vec = sample_vec(param.k, rng);
 
-    let mut t_mat = compute_t(param, pk, s_vec.as_view());
-    add_noise(&mut t_mat, param.stddev, rng);
+    let chi = DiscreteGaussian::new(param.stddev);
 
-    // C = A^T * T + E + (I_m \otimes g) * (I_m \otimes \Delta y^T)
+    // T = B * (I_{m \ell} \otimes s) + E'
+    let mut t_mat = compute_t(param, pk, s_vec.as_view());
+    chi.add_to(&mut t_mat, rng);
+
+    // C = A^T * T + \tilde{E} + (I_m \otimes g) * (I_m \otimes \Delta y^T)
     let mut c_mat = pk.a_mat.tr_mul(&t_mat);
-    add_noise(&mut c_mat, param.stddev, rng);
+    chi.add_to(&mut c_mat, rng);
     debug_assert_eq!(c_mat.shape(), (param.m_bits(), param.out_len()));
 
     let delta = param.moduli.delta::<R>();
@@ -234,6 +261,7 @@ mod tests {
     use rand_chacha::ChaCha12Rng;
 
     use super::*;
+    use crate::ring::centered;
 
     fn gen_vec_wrapping(m: usize) -> StrategyFor<Vec<Wrapping<u64>>> {
         arbitrary_with(size_range(m).lift())
@@ -277,14 +305,20 @@ mod tests {
         assert_eq!(c.shape(), (param.m_bits(), param.out_len()));
         assert_eq!(phi.shape(), (param.k, 1));
 
-        // without noise, the raw shares are exactly \Delta * (x \otimes y)
+        // the raw shares are \Delta * (x \otimes y) + e with ||e||_inf <= error_bound
         let v_raw = alice_decode_raw(c.as_view(), psi.as_view());
         let w_raw = bob_decode_raw(param, &pk, d.as_view(), phi.as_view());
-        let expected_raw = x_vec.kronecker(&y_vec) * param.moduli.delta::<R>();
-        assert_eq!(
-            (v_raw + w_raw).map(|x| x.low_bits(param.log_q())),
-            expected_raw.map(|x| x.low_bits(param.log_q()))
-        );
+        let e = v_raw + w_raw - x_vec.kronecker(&y_vec) * param.moduli.delta::<R>();
+        let e: Vec<u128> = e
+            .iter()
+            .map(|x| centered(*x, param.log_q()).unsigned_abs())
+            .collect();
+        assert!(e.iter().all(|x| *x <= param.error_bound()));
+        if param.stddev == 0.0 {
+            assert!(e.iter().all(|x| *x == 0));
+        } else {
+            assert!(e.iter().any(|x| *x != 0));
+        }
 
         let v = alice_decode(param, c.as_view(), psi.as_view());
         let w = bob_decode(param, &pk, d.as_view(), phi.as_view());
@@ -293,14 +327,21 @@ mod tests {
         reconstruct(param, v.as_view(), w.as_view())
     }
 
-    fn check_protocol<R: Ring>(moduli: Moduli, m: usize, ell: usize, k: usize, binary_input: bool) {
+    fn check_protocol<R: Ring>(
+        moduli: Moduli,
+        m: usize,
+        ell: usize,
+        k: usize,
+        stddev: f64,
+        binary_input: bool,
+    ) -> bool {
         let param = HalfNIOTEparam {
             moduli,
             m,
             ell,
             k,
+            stddev,
             binary_input,
-            stddev: 3.2,
         };
         let mut rng = ChaCha12Rng::seed_from_u64(1);
         let x_vec = if binary_input {
@@ -312,18 +353,95 @@ mod tests {
 
         let res = run_protocol(param, x_vec.as_view(), y_vec.as_view());
         let expected = x_vec.kronecker(&y_vec).map(|x| x.low_bits(moduli.log_p));
-        assert_eq!(res, expected);
+        res == expected
     }
 
     #[test]
-    fn test_protocol() {
+    fn test_protocol_no_noise() {
+        // without noise, p = q works and the protocol is exact
         for binary_input in [false, true] {
-            check_protocol::<Wrapping<u16>>(Moduli::new(12, 12), 5, 3, 2, binary_input);
-            check_protocol::<Wrapping<u16>>(Moduli::new(16, 16), 4, 7, 1, binary_input);
-            check_protocol::<Wrapping<u32>>(Moduli::new(20, 20), 3, 2, 3, binary_input);
-            check_protocol::<Wrapping<u64>>(Moduli::new(64, 32), 4, 3, 2, binary_input);
-            check_protocol::<Wrapping<u128>>(Moduli::new(128, 64), 2, 3, 1, binary_input);
+            assert!(check_protocol::<Wrapping<u16>>(
+                Moduli::new(12, 12),
+                5,
+                3,
+                2,
+                0.0,
+                binary_input
+            ));
+            assert!(check_protocol::<Wrapping<u16>>(
+                Moduli::new(16, 16),
+                4,
+                7,
+                1,
+                0.0,
+                binary_input
+            ));
+            assert!(check_protocol::<Wrapping<u32>>(
+                Moduli::new(20, 20),
+                3,
+                2,
+                3,
+                0.0,
+                binary_input
+            ));
+            assert!(check_protocol::<Wrapping<u64>>(
+                Moduli::new(64, 32),
+                4,
+                3,
+                2,
+                0.0,
+                binary_input
+            ));
         }
+    }
+
+    #[test]
+    fn test_protocol_noise() {
+        let configs = [
+            (Moduli::new(64, 20), 4, 3, 1),
+            (Moduli::new(64, 16), 4, 3, 2),
+            (Moduli::new(64, 20), 2, 5, 1),
+        ];
+        for binary_input in [false, true] {
+            for (moduli, m, ell, k) in configs {
+                let param = HalfNIOTEparam {
+                    moduli,
+                    m,
+                    ell,
+                    k,
+                    stddev: 3.2,
+                    binary_input,
+                };
+                // make sure the test is not flaky
+                assert!(param.log2_rounding_failure() < -20.0, "{param:?}");
+                assert!(check_protocol::<Wrapping<u64>>(
+                    moduli,
+                    m,
+                    ell,
+                    k,
+                    3.2,
+                    binary_input
+                ));
+            }
+            let moduli = Moduli::new(128, 64);
+            assert!(check_protocol::<Wrapping<u128>>(
+                moduli,
+                2,
+                3,
+                1,
+                3.2,
+                binary_input
+            ));
+        }
+    }
+
+    #[test]
+    fn test_protocol_noise_too_large() {
+        // Delta = 4 is much smaller than the noise, so rounding must fail
+        let moduli = Moduli::new(64, 62);
+        assert!(!check_protocol::<Wrapping<u64>>(
+            moduli, 4, 3, 1, 3.2, false
+        ));
     }
 
     fn check_apply_p<R: Ring>(moduli: Moduli, m: usize, ell: usize, k: usize) {
