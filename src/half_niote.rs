@@ -1,210 +1,224 @@
-use std::fmt::Debug;
+//! Fully correct half-succinct NIOTE for Z_p^m \otimes Z_p^ell,
+//! see Figure 12 of eprint 2026/1942 (adapted from AMR25, Construction 3.4).
 
 use nalgebra as na;
 use rand::{CryptoRng, Rng};
 
-use crate::{LazyIdentityKronecker, Scalar, sample_discrete_gaussian};
-
-pub struct HalfNIOTEpk<S: Scalar> {
-    pub a_mat: na::DMatrix<S>,
-    pub b_mat: na::DMatrix<S>,
-}
+use crate::ring::{Moduli, Ring, bits, compose, sample_binary_mat, sample_mat, sample_vec};
 
 #[derive(Clone, Copy, Debug)]
 pub struct HalfNIOTEparam {
-    pub log_q: u64,
+    pub moduli: Moduli,
+    // length of Alice's input (\bar{m} in the paper)
     pub m: usize,
+    // length of Bob's input
     pub ell: usize,
-    pub k: usize, // lwe dim
+    // lwe dim
+    pub k: usize,
+    // If set, Alice's input must be binary and it is hashed directly,
+    // instead of hashing its bit decomposition.
+    // This is used for the inner levels of the succinct NIOTE,
+    // where Alice's input is already a bit decomposition of digests.
+    pub binary_input: bool,
     pub stddev: f64,
 }
 
 impl HalfNIOTEparam {
+    pub fn log_q(&self) -> u32 {
+        self.moduli.log_q
+    }
+
+    // length of the digest
     pub fn n(&self) -> usize {
-        self.k * self.log_q as usize
+        self.k * self.log_q() as usize
     }
 
-    // length of Alice's input
-    pub fn m(&self) -> usize {
-        self.m
+    // number of bits used to represent one element of Alice's input
+    pub fn gadget_width(&self) -> usize {
+        if self.binary_input {
+            1
+        } else {
+            self.log_q() as usize
+        }
     }
 
-    pub fn log_q(&self) -> u64 {
-        self.log_q
+    // length of Alice's hashed (binary) vector
+    pub fn m_bits(&self) -> usize {
+        self.m * self.gadget_width()
     }
 
-    // length of Bob's input
-    pub fn ell(&self) -> usize {
-        self.ell
-    }
-
-    // length of the LWE secret
-    pub fn k(&self) -> usize {
-        self.k
+    // length of the output shares
+    pub fn out_len(&self) -> usize {
+        self.m * self.ell
     }
 }
 
-pub fn setup<R: Rng + CryptoRng, S: Scalar>(param: HalfNIOTEparam, _rng: &mut R) -> HalfNIOTEpk<S> {
-    // let a_mat = na::DMatrix::<bool>::from_distribution_generic(
-    //     nalgebra::Dyn(param.n),
-    //     nalgebra::Dyn(param.m * param.log_q),
-    //     &UniformRandomBool,
-    //     rng,
-    // );
-    let a_mat = na::DMatrix::<bool>::new_random(param.n(), param.m * param.log_q as usize);
-    let a_mat = a_mat.map(|x| if x { S::one() } else { S::zero() });
+pub struct HalfNIOTEpk<R: Ring> {
+    // n x m_bits, binary
+    pub a_mat: na::DMatrix<R>,
+    // n x (m * ell * k), uniform
+    pub b_mat: na::DMatrix<R>,
+}
 
-    let b_mat = na::DMatrix::<bool>::new_random(param.n(), param.m * param.ell * param.n());
-    let b_mat = b_mat.map(|x| if x { S::one() } else { S::zero() });
-
+pub fn setup<R: Ring>(param: HalfNIOTEparam, rng: &mut (impl Rng + CryptoRng)) -> HalfNIOTEpk<R> {
+    param.moduli.check::<R>();
+    let a_mat = sample_binary_mat(param.n(), param.m_bits(), rng);
+    let b_mat = sample_mat(param.n(), param.out_len() * param.k, rng);
     HalfNIOTEpk { a_mat, b_mat }
 }
 
-fn bits<S: Scalar>(x_vec: na::DVectorView<S>) -> na::DVector<S> {
-    let input_len = x_vec.len();
-    // bits function
-    let x_vec_hat = x_vec.iter().flat_map(|x| x.view_bits()).collect::<Vec<S>>();
-    assert_eq!(x_vec_hat.len(), S::BIT_LENGTH * input_len);
-    na::DVector::from_vec(x_vec_hat)
+// TODO sample from a discrete Gaussian with standard deviation `stddev`,
+// the noise is zero for now since we only care about correctness.
+fn add_noise<R: Ring>(_mat: &mut na::DMatrix<R>, _stddev: f64, _rng: &mut (impl Rng + CryptoRng)) {}
+
+/// returns (d = A * x_hat, psi = x_hat)
+pub fn alice_encode<R: Ring>(
+    param: HalfNIOTEparam,
+    pk: &HalfNIOTEpk<R>,
+    x_vec: na::DVectorView<R>,
+) -> (na::DVector<R>, na::DVector<R>) {
+    assert_eq!(x_vec.len(), param.m);
+    let x_hat = if param.binary_input {
+        debug_assert!(x_vec.iter().all(|x| *x == R::zero() || *x == R::one()));
+        x_vec.clone_owned()
+    } else {
+        bits(x_vec, param.log_q())
+    };
+    let d = &pk.a_mat * &x_hat;
+    (d, x_hat)
 }
 
-/// returns (d, psi = x_hat)
-pub fn alice_encode<S: Scalar>(
-    pk: &HalfNIOTEpk<S>,
-    x_vec: na::DVectorView<S>,
-) -> (na::DVector<S>, na::DVector<S>) {
-    let a_mat: na::DMatrixView<S> = pk.a_mat.as_view();
-    let x_vec_hat = bits(x_vec);
-    debug_assert_eq!(x_vec_hat.len(), x_vec.len() * S::BIT_LENGTH);
-    let d = a_mat * &x_vec_hat;
-    (d, x_vec_hat)
-}
-
-// this can be a constant/lazy static
-pub(crate) fn gadget_vec<S: Scalar>() -> na::DVector<S> {
-    let log_q = S::BIT_LENGTH;
-    let mut v = Vec::with_capacity(log_q as usize);
-    for i in 0..log_q {
-        v.push(S::from_u64(1u64 << i));
+/// T = B * (I_{m \ell} \otimes s)
+fn compute_t<R: Ring>(
+    param: HalfNIOTEparam,
+    pk: &HalfNIOTEpk<R>,
+    s: na::DVectorView<R>,
+) -> na::DMatrix<R> {
+    let k = param.k;
+    let mut t_mat = na::DMatrix::zeros(param.n(), param.out_len());
+    for h in 0..param.out_len() {
+        t_mat
+            .column_mut(h)
+            .gemv(R::one(), &pk.b_mat.columns(h * k, k), &s, R::zero());
     }
-    na::DVector::from_vec(v)
+    t_mat
 }
 
-fn compute_z<S: Scalar>(
+/// returns (C, phi = s)
+pub fn bob_encode<R: Ring>(
     param: HalfNIOTEparam,
-    pk: &HalfNIOTEpk<S>,
-    s: na::DVectorView<S>,
-    g_vec: na::DVectorView<S>,
-) -> na::DMatrix<S> {
-    // let id_ml = na::DMatrix::identity(param.m * param.ell, param.m * param.ell);
-    // &pk.b_mat * id_ml.kronecker(&s.kronecker(&g_vec))
-    // NOTE: compared to the above, we have about −96.639% improvement
-    let s_mul_g = s.kronecker(&g_vec);
-    pk.b_mat.as_view() * LazyIdentityKronecker::new(param.m * param.ell, s_mul_g.as_view())
-}
-
-// fn compute_z_prime(
-//     param: HalfNIOTEparam,
-//     y_delta_vec: na::DVectorView<Wrapping<u64>>,
-//     g_vec: na::DVectorView<Wrapping<u64>>,
-// ) -> na::DMatrix<Wrapping<u64>> {
-//     let id_m = na::DMatrix::identity(param.m, param.m);
-//     id_m.kronecker(&y_delta_vec.transpose().kronecker(&g_vec))
-// }
-
-// returns (c, phi=s)
-pub fn bob_encode<S: Scalar>(
-    param: HalfNIOTEparam,
-    pk: &HalfNIOTEpk<S>,
-    y_vec: na::DVectorView<S>,
+    pk: &HalfNIOTEpk<R>,
+    y_vec: na::DVectorView<R>,
     rng: &mut (impl Rng + CryptoRng),
-) -> (na::DMatrix<S>, na::DVector<S>)
-where
-    rand::distr::StandardUniform: rand::distr::Distribution<S>,
-{
-    // B * (I_{m \ell} \otimes s \otimes g^T_q)
-    let s_vec = na::DVector::<S>::new_random(param.k);
-    debug_assert_eq!(s_vec.shape(), (param.k, 1)); // This means it is a column matrix
-    let g_vec = gadget_vec::<S>();
-    debug_assert_eq!(
-        pk.b_mat.shape(),
-        (param.n(), param.m * param.ell * param.n())
-    );
-    let z = compute_z(param, pk, s_vec.as_view(), g_vec.as_view());
-    debug_assert_eq!(z.shape(), (param.n(), param.m * param.ell));
+) -> (na::DMatrix<R>, na::DVector<R>) {
+    assert_eq!(y_vec.len(), param.ell);
+    let s_vec = sample_vec(param.k, rng);
 
-    // I_m \otimes (y * q/2)^T \otimes g^T_q
-    let delta = S::from_u64(1u64 << (param.log_q - 1)); // q/2
-    let y_delta_vec = y_vec * delta;
+    let mut t_mat = compute_t(param, pk, s_vec.as_view());
+    add_noise(&mut t_mat, param.stddev, rng);
 
-    // let z_prime = compute_z_prime(param, y_delta_vec.as_view(), g_vec.as_view());
-    let y_kro_g = y_delta_vec.transpose().kronecker(&g_vec);
-    let z_prime = LazyIdentityKronecker::new(param.m, y_kro_g.as_view());
+    // C = A^T * T + E + (I_m \otimes g) * (I_m \otimes \Delta y^T)
+    let mut c_mat = pk.a_mat.tr_mul(&t_mat);
+    add_noise(&mut c_mat, param.stddev, rng);
+    debug_assert_eq!(c_mat.shape(), (param.m_bits(), param.out_len()));
 
-    debug_assert_eq!(
-        z_prime.shape(),
-        (param.m * param.log_q as usize, param.m * param.ell)
-    );
+    let delta = param.moduli.delta::<R>();
+    let width = param.gadget_width();
+    for i in 0..param.m {
+        for b in 0..width {
+            let g_b = R::pow2(b as u32) * delta;
+            for c in 0..param.ell {
+                c_mat[(i * width + b, i * param.ell + c)] += g_b * y_vec[c];
+            }
+        }
+    }
 
-    // errors
-    let e_prime =
-        sample_discrete_gaussian::<_, S>(rng, param.stddev, param.n(), param.m * param.ell);
-    let e_tilde = sample_discrete_gaussian::<_, S>(
-        rng,
-        param.stddev,
-        param.m * param.log_q as usize,
-        param.m * param.ell,
-    );
-
-    // put everything together
-    let a_mat_t = pk.a_mat.transpose();
-    let c_mat = &a_mat_t * z + a_mat_t * e_prime + (e_tilde.as_view() + z_prime);
-    debug_assert_eq!(
-        c_mat.shape(),
-        (param.m * param.log_q as usize, param.m * param.ell)
-    );
-
-    // send c_mat to alice
     (c_mat, s_vec)
 }
 
-// returns v = C^T * x_hat
-pub fn alice_decode<S: Scalar>(
-    c_mat: na::DMatrixView<S>,
-    psi: na::DVectorView<S>,
-) -> na::DVector<S> {
-    let x_vec_hat = psi;
-    c_mat.transpose() * x_vec_hat
+/// returns v = C^T * x_hat in Z_q
+pub fn alice_decode_raw<R: Ring>(
+    c_mat: na::DMatrixView<R>,
+    psi: na::DVectorView<R>,
+) -> na::DVector<R> {
+    c_mat.tr_mul(&psi)
 }
 
-// returns w = - (I_{m \ell} \otimes s^T \otimes g_q) * B^T * d
-pub fn bob_decode<S: Scalar>(
+/// returns w = -(I_{m \ell} \otimes s^T) * B^T * d in Z_q
+pub fn bob_decode_raw<R: Ring>(
     param: HalfNIOTEparam,
-    pk: &HalfNIOTEpk<S>,
-    d_vec: na::DVectorView<S>,
-    phi: na::DVectorView<S>,
-) -> na::DVector<S> {
-    let id_ml = na::DMatrix::identity(param.m * param.ell, param.m * param.ell);
-    let s = phi;
-    let g_vec_t = gadget_vec::<S>().transpose();
-
-    // output d, note that this is not negated, we negate during reconstruction
-    id_ml.kronecker(&s.transpose().kronecker(&g_vec_t)) * pk.b_mat.transpose() * d_vec
+    pk: &HalfNIOTEpk<R>,
+    d_vec: na::DVectorView<R>,
+    phi: na::DVectorView<R>,
+) -> na::DVector<R> {
+    let k = param.k;
+    let bt_d = pk.b_mat.tr_mul(&d_vec);
+    na::DVector::from_fn(param.out_len(), |h, _| -bt_d.rows(h * k, k).dot(&phi))
 }
 
-pub fn reconstruct<S: Scalar>(
+/// Bilinear encoder evaluation (Lemma 7): returns P * v_hat such that
+/// P * (Bits(d) \otimes Bits(s)) = bob_decode_raw(d, s).
+/// Since P is linear, it can be applied to additive shares of Bits(d) \otimes Bits(s).
+pub fn apply_p<R: Ring>(
     param: HalfNIOTEparam,
-    v: na::DVectorView<S>,
-    w: na::DVectorView<S>,
-) -> na::DVector<S> {
-    (v - w).map(|x| {
-        // we need to divide by q/2 and round
-        // this is basically the same as shift right by 63
-        //
-        // we don't have shl or shr implemented for Scalar
-        // so manually convert to and from u64 to shift
-        S::from_u64(x.as_u64() >> (param.log_q - 1))
+    pk: &HalfNIOTEpk<R>,
+    v_hat: na::DVectorView<R>,
+) -> na::DVector<R> {
+    let (n, k, log_q) = (param.n(), param.k, param.log_q() as usize);
+    assert_eq!(v_hat.len(), n * log_q * k * log_q);
+
+    // compose the bits of s: w[c * k + a] = \sum_b 2^b v_hat[c * k log_q + a log_q + b]
+    let w = compose(v_hat, param.log_q());
+    // compose the bits of d: u[i, a] = \sum_b 2^b w[(i log_q + b) * k + a]
+    // so u is a share of d * s^T
+    let mut u = na::DMatrix::<R>::zeros(n, k);
+    for i in 0..n {
+        for b in 0..log_q {
+            let g_b = R::pow2(b as u32);
+            for a in 0..k {
+                u[(i, a)] += g_b * w[(i * log_q + b) * k + a];
+            }
+        }
+    }
+
+    // out[h] = -\sum_{i, a} B[i, h k + a] * u[i, a]
+    na::DVector::from_fn(param.out_len(), |h, _| {
+        let mut acc = R::zero();
+        for a in 0..k {
+            acc += pk.b_mat.column(h * k + a).dot(&u.column(a));
+        }
+        -acc
     })
+}
+
+pub fn alice_decode<R: Ring>(
+    param: HalfNIOTEparam,
+    c_mat: na::DMatrixView<R>,
+    psi: na::DVectorView<R>,
+) -> na::DVector<R> {
+    param
+        .moduli
+        .round_vec(alice_decode_raw(c_mat, psi).as_view())
+}
+
+pub fn bob_decode<R: Ring>(
+    param: HalfNIOTEparam,
+    pk: &HalfNIOTEpk<R>,
+    d_vec: na::DVectorView<R>,
+    phi: na::DVectorView<R>,
+) -> na::DVector<R> {
+    param
+        .moduli
+        .round_vec(bob_decode_raw(param, pk, d_vec, phi).as_view())
+}
+
+/// v + w mod p, where v and w are the (rounded) outputs of the decoders
+pub fn reconstruct<R: Ring>(
+    param: HalfNIOTEparam,
+    v: na::DVectorView<R>,
+    w: na::DVectorView<R>,
+) -> na::DVector<R> {
+    param.moduli.reduce_p_vec((v + w).as_view())
 }
 
 #[cfg(test)]
@@ -221,7 +235,7 @@ mod tests {
 
     use super::*;
 
-    fn gen_vec_wrapping(m: usize) -> StrategyFor<Vec<Wrapping<u16>>> {
+    fn gen_vec_wrapping(m: usize) -> StrategyFor<Vec<Wrapping<u64>>> {
         arbitrary_with(size_range(m).lift())
     }
 
@@ -231,52 +245,121 @@ mod tests {
 
     proptest! {
         #[test]
-        fn test_protocol(xs in gen_vec_wrapping(4), ys in gen_bool(2)) {
-            run_protocol::<Wrapping<u16>>(xs, ys);
+        fn test_protocol_mod_2(xs in gen_vec_wrapping(4), ys in gen_bool(2)) {
+            let param = HalfNIOTEparam {
+                moduli: Moduli::new(64, 1),
+                m: xs.len(),
+                ell: ys.len(),
+                k: 2,
+                binary_input: false,
+                stddev: 3.2,
+            };
+            let x_vec = na::DVector::from_vec(xs);
+            let y_vec = na::DVector::from_vec(ys.into_iter().map(|y| Wrapping(y as u64)).collect());
+            let res = run_protocol(param, x_vec.as_view(), y_vec.as_view());
+
+            let expected = x_vec.kronecker(&y_vec).map(|x| Wrapping(x.0 % 2));
+            assert_eq!(res, expected);
         }
     }
 
-    fn run_protocol<S: Scalar>(xs: Vec<S>, ys: Vec<bool>)
-    where
-        rand::distr::StandardUniform: rand::distr::Distribution<S>,
-    {
-        let param = HalfNIOTEparam {
-            log_q: S::BIT_LENGTH as u64,
-            m: xs.len(),
-            ell: ys.len(),
-            k: 2,
-            stddev: 3.2,
-        };
-        // println!("[test] half niote with param: {param:?}");
-
+    fn run_protocol<R: Ring>(
+        param: HalfNIOTEparam,
+        x_vec: na::DVectorView<R>,
+        y_vec: na::DVectorView<R>,
+    ) -> na::DVector<R> {
         let mut rng = ChaCha12Rng::from_os_rng();
-
         let pk = setup(param, &mut rng);
 
-        let x_vec = na::DVector::from_vec(xs);
-        let (d, psi) = alice_encode::<S>(&pk, x_vec.as_view());
-
-        let y_vec = na::DVector::from_vec(ys.into_iter().map(|y| S::from_u64(y as u64)).collect());
-        let (c, phi) = bob_encode(param, &pk, y_vec.as_view(), &mut rng);
+        let (d, psi) = alice_encode(param, &pk, x_vec);
+        assert_eq!(d.shape(), (param.n(), 1));
+        let (c, phi) = bob_encode(param, &pk, y_vec, &mut rng);
+        assert_eq!(c.shape(), (param.m_bits(), param.out_len()));
         assert_eq!(phi.shape(), (param.k, 1));
 
-        // note that because the A matrix is not n by m anymore, but n by m log q,
-        // that's why the dimension of C needs to be multiplied by log q
+        // without noise, the raw shares are exactly \Delta * (x \otimes y)
+        let v_raw = alice_decode_raw(c.as_view(), psi.as_view());
+        let w_raw = bob_decode_raw(param, &pk, d.as_view(), phi.as_view());
+        let expected_raw = x_vec.kronecker(&y_vec) * param.moduli.delta::<R>();
         assert_eq!(
-            c.shape(),
-            (param.m * param.log_q as usize, param.m * param.ell)
+            (v_raw + w_raw).map(|x| x.low_bits(param.log_q())),
+            expected_raw.map(|x| x.low_bits(param.log_q()))
         );
 
-        let v = alice_decode(c.as_view(), psi.as_view());
+        let v = alice_decode(param, c.as_view(), psi.as_view());
         let w = bob_decode(param, &pk, d.as_view(), phi.as_view());
-        assert_eq!(v.shape(), (param.m * param.ell, 1));
+        assert_eq!(v.shape(), (param.out_len(), 1));
         assert_eq!(v.shape(), w.shape());
+        reconstruct(param, v.as_view(), w.as_view())
+    }
 
-        let actual = reconstruct(param, v.as_view(), w.as_view());
-        assert_eq!(v.shape(), actual.shape());
+    fn check_protocol<R: Ring>(moduli: Moduli, m: usize, ell: usize, k: usize, binary_input: bool) {
+        let param = HalfNIOTEparam {
+            moduli,
+            m,
+            ell,
+            k,
+            binary_input,
+            stddev: 3.2,
+        };
+        let mut rng = ChaCha12Rng::seed_from_u64(1);
+        let x_vec = if binary_input {
+            na::DVector::from_fn(m, |_, _| R::from_bool(rng.random()))
+        } else {
+            sample_vec::<R, _>(m, &mut rng).map(|x| x.low_bits(moduli.log_p))
+        };
+        let y_vec = sample_vec::<R, _>(ell, &mut rng).map(|x| x.low_bits(moduli.log_p));
 
-        // round(v + m)_p = x \otimes y mod p
-        let expected = x_vec.kronecker(&y_vec).map(|x| S::from_u64(x.as_u64() % 2));
-        assert_eq!(actual, expected);
+        let res = run_protocol(param, x_vec.as_view(), y_vec.as_view());
+        let expected = x_vec.kronecker(&y_vec).map(|x| x.low_bits(moduli.log_p));
+        assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn test_protocol() {
+        for binary_input in [false, true] {
+            check_protocol::<Wrapping<u16>>(Moduli::new(12, 12), 5, 3, 2, binary_input);
+            check_protocol::<Wrapping<u16>>(Moduli::new(16, 16), 4, 7, 1, binary_input);
+            check_protocol::<Wrapping<u32>>(Moduli::new(20, 20), 3, 2, 3, binary_input);
+            check_protocol::<Wrapping<u64>>(Moduli::new(64, 32), 4, 3, 2, binary_input);
+            check_protocol::<Wrapping<u128>>(Moduli::new(128, 64), 2, 3, 1, binary_input);
+        }
+    }
+
+    fn check_apply_p<R: Ring>(moduli: Moduli, m: usize, ell: usize, k: usize) {
+        let param = HalfNIOTEparam {
+            moduli,
+            m,
+            ell,
+            k,
+            binary_input: false,
+            stddev: 3.2,
+        };
+        let mut rng = ChaCha12Rng::seed_from_u64(2);
+        let pk = setup::<R>(param, &mut rng);
+        let d = sample_vec::<R, _>(param.n(), &mut rng);
+        let s = sample_vec::<R, _>(param.k, &mut rng);
+
+        let d_hat = bits(d.as_view(), moduli.log_q);
+        let s_hat = bits(s.as_view(), moduli.log_q);
+        let tensor = d_hat.kronecker(&s_hat);
+
+        // P applied to shares of the tensor
+        let share0 = sample_vec::<R, _>(tensor.len(), &mut rng);
+        let share1 = &tensor - &share0;
+        let out = apply_p(param, &pk, share0.as_view()) + apply_p(param, &pk, share1.as_view());
+
+        let expected = bob_decode_raw(param, &pk, d.as_view(), s.as_view());
+        assert_eq!(
+            out.map(|x| x.low_bits(moduli.log_q)),
+            expected.map(|x| x.low_bits(moduli.log_q))
+        );
+    }
+
+    #[test]
+    fn test_apply_p() {
+        check_apply_p::<Wrapping<u16>>(Moduli::new(12, 12), 3, 2, 2);
+        check_apply_p::<Wrapping<u32>>(Moduli::new(32, 16), 2, 3, 1);
+        check_apply_p::<Wrapping<u64>>(Moduli::new(64, 32), 2, 2, 3);
     }
 }

@@ -1,279 +1,297 @@
+//! Succinct NIOTE for Z_p^m \otimes Z_p^ell with m = t^r n, obtained by bootstrapping
+//! the half-succinct NIOTE along a t-ary tree, see Figures 13 and 14 of eprint 2026/1942.
+//!
+//! Levels are indexed as in the paper: j = 0 is the root and j = r - 1 are the leaves.
+//! Level j has t^j blocks.
+//! - The leaf level uses hOTE_ell for Z_p^{tn} \otimes Z_p^ell.
+//! - The inner levels j = r - 2, ..., 1 and the root use hOTE_n for
+//!   Z_p^{tn log q} \otimes Z_p^n, where Alice's input is the bit decomposition
+//!   of t child digests and Bob's input is Bits(phi_{j+1}).
+//!
+//! NOTE: the root uses hOTE_n instead of a hasher-private OTE,
+//! so the digest is not hasher-private.
+
 use nalgebra as na;
 use rand::{CryptoRng, Rng};
 
 use crate::{
-    Scalar,
-    half_niote::{self, HalfNIOTEparam, HalfNIOTEpk, gadget_vec},
+    half_niote::{self, HalfNIOTEparam, HalfNIOTEpk},
+    ring::{Moduli, Party, Prf, Ring, bits},
 };
 
 #[derive(Clone, Copy, Debug)]
 pub struct NIOTEparam {
-    pub half: HalfNIOTEparam,
+    pub moduli: Moduli,
+    // lwe dim
+    pub k: usize,
+    // arity of the tree
     pub t: usize,
+    // depth of the tree
     pub r: usize,
+    // length of Bob's input
+    pub ell: usize,
+    pub stddev: f64,
 }
 
 impl NIOTEparam {
-    pub fn is_consistent(&self) -> bool {
-        self.half.m() == self.half.n() * self.t.pow(self.r as u32)
+    pub fn log_q(&self) -> u32 {
+        self.moduli.log_q
     }
 
+    // length of the digest
     pub fn n(&self) -> usize {
-        self.half.n()
+        self.k * self.log_q() as usize
     }
 
-    pub fn log_q(&self) -> u64 {
-        self.half.log_q()
-    }
-
+    // length of Alice's input
     pub fn m(&self) -> usize {
-        self.half.m()
+        self.t.pow(self.r as u32) * self.n()
     }
 
-    pub fn ell(&self) -> usize {
-        self.half.ell()
+    pub fn blocks(&self, j: usize) -> usize {
+        self.t.pow(j as u32)
     }
 
-    pub fn k(&self) -> usize {
-        self.half.k()
-    }
-
-    pub fn t_pow_r_minus_i_1(&self, i: usize) -> usize {
-        self.t.pow((self.r - i - 1) as u32)
-    }
-}
-
-pub struct NIOTEpk<S: Scalar> {
-    half: HalfNIOTEpk<S>,
-    p_mat_prods: Vec<na::DMatrix<S>>,
-}
-
-pub fn setup<R: Rng + CryptoRng, S: Scalar>(param: NIOTEparam, rng: &mut R) -> NIOTEpk<S> {
-    let pk = half_niote::setup(param.half, rng);
-
-    // TODO how to come up with p_mat?
-    let p_mat: na::DMatrix<S> =
-        na::DMatrix::identity(param.n() * param.n(), param.t * param.n() * param.n());
-    /*
-    // nt^r
-    let nt_to_r = param.t.pow(param.r as u32) * param.n();
-    let ident_tnr: na::DMatrix<S> = na::DMatrix::identity(nt_to_r, nt_to_r);
-    let g = gadget_vec::<S>();
-    let p_mat: na::DMatrix<S> = &pk.a_mat * (ident_tnr.kronecker(&g));
-    assert_eq!(pk.a_mat.shape(), (param.n(), nt_to_r * S::BIT_LENGTH));
-    */
-
-    // let ident_logq: na::DMatrix<S> = na::DMatrix::identity(S::BIT_LENGTH, S::BIT_LENGTH);
-    // let p_mat: na::DMatrix<S> = pk.a_mat.kronecker(&ident_logq);
-    let p_mat_prods = scan_p_mat_prods(param, p_mat.as_view());
-
-    #[cfg(test)]
-    {
-        for (i, p) in p_mat_prods.iter().enumerate() {
-            println!("p dims: {i}, {:?}", p.shape())
+    /// hOTE_ell: Z_p^{tn} \otimes Z_p^ell
+    pub fn leaf_param(&self) -> HalfNIOTEparam {
+        HalfNIOTEparam {
+            moduli: self.moduli,
+            m: self.t * self.n(),
+            ell: self.ell,
+            k: self.k,
+            binary_input: false,
+            stddev: self.stddev,
         }
     }
 
+    /// hOTE_n: Z_p^{tn log q} \otimes Z_p^n
+    pub fn inner_param(&self) -> HalfNIOTEparam {
+        HalfNIOTEparam {
+            moduli: self.moduli,
+            m: self.t * self.n() * self.log_q() as usize,
+            ell: self.n(),
+            k: self.k,
+            binary_input: true,
+            stddev: self.stddev,
+        }
+    }
+
+    /// Length of the shares of Bits(h) \otimes Bits(phi) for a single child digest h,
+    /// which is the input of the bilinear map P (or P').
+    fn child_tensor_len(&self) -> usize {
+        self.n() * self.log_q() as usize * self.n()
+    }
+
+    /// Total number of ring elements in the encoding E = (E_0, ..., E_{r-1}).
+    pub fn encoding_len(&self) -> usize {
+        let leaf = self.leaf_param();
+        let inner = self.inner_param();
+        leaf.m_bits() * leaf.out_len() + (self.r - 1) * inner.m_bits() * inner.out_len()
+    }
+
+    /// Total number of ring elements in the public key.
+    pub fn pk_len(&self) -> usize {
+        let leaf = self.leaf_param();
+        let inner = self.inner_param();
+        let n = self.n();
+        n * (leaf.m_bits() + leaf.out_len() * self.k)
+            + n * (inner.m_bits() + inner.out_len() * self.k)
+    }
+}
+
+pub struct NIOTEpk<R: Ring> {
+    leaf: HalfNIOTEpk<R>,
+    inner: HalfNIOTEpk<R>,
+    prf: Prf,
+}
+
+pub fn setup<R: Ring>(param: NIOTEparam, rng: &mut (impl Rng + CryptoRng)) -> NIOTEpk<R> {
+    assert!(param.r >= 2, "the tree must have at least two levels");
     NIOTEpk {
-        half: pk,
-        p_mat_prods,
+        leaf: half_niote::setup(param.leaf_param(), rng),
+        inner: half_niote::setup(param.inner_param(), rng),
+        prf: Prf::new(rng),
     }
 }
 
-// output (d, psi)
-#[allow(clippy::type_complexity)]
-pub fn alice_encode<S: Scalar>(
+fn concat<R: Ring>(parts: &[na::DVector<R>]) -> na::DVector<R> {
+    let len = parts.iter().map(|p| p.len()).sum();
+    na::DVector::from_iterator(len, parts.iter().flat_map(|p| p.iter().copied()))
+}
+
+/// PRF context for lifting the shares of block i at level j,
+/// both parties must use the same context.
+fn lift_ctx(j: usize, i: usize) -> u64 {
+    ((j as u64) << 40) | i as u64
+}
+
+/// Alice's secret information, psi[j][i] is the state of block i at level j.
+pub type AliceState<R> = Vec<Vec<na::DVector<R>>>;
+
+/// returns (d, psi)
+pub fn alice_encode<R: Ring>(
     param: NIOTEparam,
-    pk: &NIOTEpk<S>,
-    x_vec: na::DVectorView<S>,
-) -> (na::DVector<S>, Vec<Vec<na::DVector<S>>>) {
-    let mut x_i = x_vec.clone_owned();
-    let mut psi_out = vec![];
-    for i in 0..param.r {
-        let step = param.n() * param.t;
-        let j_len = param.t_pow_r_minus_i_1(i);
-        // x_{i+1} should have length t^{r - i - 1} \cdot n
-        let mut x_ip1 = na::DVector::zeros(j_len * param.n());
-        let mut psi_i = Vec::with_capacity(j_len);
+    pk: &NIOTEpk<R>,
+    x_vec: na::DVectorView<R>,
+) -> (na::DVector<R>, AliceState<R>) {
+    assert_eq!(x_vec.len(), param.m());
+    let mut psi = vec![vec![]; param.r];
 
-        for j in 0..j_len {
-            // x_i is a column vector, consider x_ij as the vertical conccatenation of the column vector
-            let x_i_view = x_i.rows(j * step, step);
-            debug_assert_eq!(x_i_view.shape(), (step, 1));
+    // leaf level: hash t^{r-1} blocks of length tn
+    let leaf = param.leaf_param();
+    let mut digests = Vec::with_capacity(param.blocks(param.r - 1));
+    for i in 0..param.blocks(param.r - 1) {
+        let x_i = x_vec.rows(i * leaf.m, leaf.m);
+        let (h, psi_i) = half_niote::alice_encode(leaf, &pk.leaf, x_i);
+        digests.push(h);
+        psi[param.r - 1].push(psi_i);
+    }
 
-            let (d_ij, psi_ij) = half_niote::alice_encode(&pk.half, x_i_view);
-            psi_i.push(psi_ij);
-
-            // TODO reduce data movement by using mul_to in `half_niote::alice_encode` and write the result to mut view
-            let mut x_ip1_view = x_ip1.rows_mut(j * param.n(), param.n());
-            x_ip1_view.copy_from(&d_ij);
+    // inner levels and root: hash t^j blocks of t bit-decomposed child digests
+    let inner = param.inner_param();
+    for j in (0..param.r - 1).rev() {
+        let d_hat = bits(concat(&digests).as_view(), param.log_q());
+        debug_assert_eq!(d_hat.len(), param.blocks(j) * inner.m);
+        digests = Vec::with_capacity(param.blocks(j));
+        for i in 0..param.blocks(j) {
+            let d_hat_i = d_hat.rows(i * inner.m, inner.m);
+            let (h, psi_i) = half_niote::alice_encode(inner, &pk.inner, d_hat_i);
+            digests.push(h);
+            psi[j].push(psi_i);
         }
-
-        x_i = x_ip1;
-        psi_out.push(psi_i);
     }
 
-    (x_i, psi_out)
+    assert_eq!(digests.len(), 1);
+    (digests.pop().unwrap(), psi)
 }
 
-// output { E_i }, phi
-pub fn bob_encode<S: Scalar>(
+/// returns ({E_j}, phi_0), where the encodings are indexed by level
+pub fn bob_encode<R: Ring>(
     param: NIOTEparam,
-    pk: &NIOTEpk<S>,
-    y_vec: na::DVectorView<S>,
+    pk: &NIOTEpk<R>,
+    y_vec: na::DVectorView<R>,
     rng: &mut (impl Rng + CryptoRng),
-) -> (Vec<na::DMatrix<S>>, na::DVector<S>)
-where
-    rand::distr::StandardUniform: rand::distr::Distribution<S>,
-{
+) -> (Vec<na::DMatrix<R>>, na::DVector<R>) {
+    assert_eq!(y_vec.len(), param.ell);
     let mut e_out = Vec::with_capacity(param.r);
-    // the first iteration is different from the rest in terms of dimension, so we do it separately
-    let (e_mat_0, phi_1) = half_niote::bob_encode(param.half, &pk.half, y_vec, rng);
 
-    // note that usually for hOTE the output dimension is (m log q, m l)
-    // but here we've instantiated hOTE with size m = nt
-    debug_assert_eq!(
-        e_mat_0.shape(),
-        (
-            param.t * param.n() * param.log_q() as usize,
-            param.t * param.n() * param.ell()
-        )
-    );
-    e_out.push(e_mat_0);
+    let (e_leaf, mut phi) = half_niote::bob_encode(param.leaf_param(), &pk.leaf, y_vec, rng);
+    e_out.push(e_leaf);
 
-    if param.r == 1 {
-        return (e_out, phi_1);
+    for _ in (0..param.r - 1).rev() {
+        let phi_hat = bits(phi.as_view(), param.log_q());
+        let (e_j, phi_j) =
+            half_niote::bob_encode(param.inner_param(), &pk.inner, phi_hat.as_view(), rng);
+        e_out.push(e_j);
+        phi = phi_j;
     }
 
-    let g = gadget_vec::<S>();
-    let mut y_i = phi_1.kronecker(&g);
-
-    for i in 1..param.r {
-        debug_assert_eq!(y_i.shape(), (param.log_q() as usize * param.k(), 1));
-        let (e_mat_i, phi_ip1) = half_niote::bob_encode(param.half, &pk.half, y_i.as_view(), rng);
-        debug_assert_eq!(
-            e_mat_i.shape(),
-            (
-                param.t * param.n() * param.log_q() as usize,
-                param.t * param.n() * param.ell()
-            )
-        );
-
-        e_out.push(e_mat_i);
-
-        if i == param.r - 1 {
-            return (e_out, phi_ip1);
-        }
-
-        y_i = phi_ip1.kronecker(&g);
-    }
-
-    unreachable!()
+    // index by level, i.e., the root is at index 0
+    e_out.reverse();
+    (e_out, phi)
 }
 
-// compute
-// \{  \prod_i=1^k P_i  \} for k \in [r]
-// where P_i = I_{t^{r-i-1}} \otimes P
-fn scan_p_mat_prods<S: Scalar>(
+/// returns Alice's share v in Z_p^{m \ell}
+pub fn alice_decode<R: Ring>(
     param: NIOTEparam,
-    p_mat: na::DMatrixView<S>,
-) -> Vec<na::DMatrix<S>> {
-    // P: n^2 \times tn^2
-    assert_eq!(
-        p_mat.shape(),
-        (param.n() * param.n(), param.n() * param.n() * param.t)
-    );
-
-    // P_i will have dimension (n*t^{r - 1 - i}, n*t^{r - i})
-    // below we remove the factor n for brevity, so the above becomes (t^{r - 1 - i}, t^{r - i})
-    // P_0               : (t^{r - 1}, t^r)
-    // P_1 * P_0         : (t^{r - 2}, t^{r - 1}) * (t^{r - 1}, t^{r})
-    //                   : (t^{r - 2}, t^{r})
-    // P_2 * P_1 * P_0   : (t^{r - 3}, t^{r - 2}), (t^{r - 2}, t^{r})
-    //                   : (t^{r - 3}, t^{r})
-    // P_{r-1} *...* P_0 : (t^0, t^r)
-    let mut p_mats = (0..param.r).map(|i| {
-        let t_pow = param.t_pow_r_minus_i_1(i);
-        // let t_pow = param.t.pow((param.r - i) as u32);
-        let id = na::DMatrix::identity(t_pow, t_pow);
-        id.kronecker(&p_mat)
-    });
-
-    // fill the accummulator with the first element
-    let mut acc: na::DMatrix<S> = p_mats.next().unwrap();
-    let mut steps = Vec::with_capacity(param.r);
-    steps.push(acc.clone());
-
-    // fill the rest
-    for p_mat_i in p_mats {
-        // dimension of acc will reduce on every iteration
-        acc = p_mat_i * acc;
-        steps.push(acc.clone());
-    }
-    steps
-}
-
-// output v_r
-pub fn alice_decode<S: Scalar>(
-    param: NIOTEparam,
-    pk: &NIOTEpk<S>,
-    e_mats: &[na::DMatrix<S>],
-    psi: &[Vec<na::DVector<S>>],
-) -> na::DVector<S> {
+    pk: &NIOTEpk<R>,
+    e_mats: &[na::DMatrix<R>],
+    psi: &AliceState<R>,
+) -> na::DVector<R> {
     assert_eq!(e_mats.len(), param.r);
-    let mut acc = na::DVector::zeros(param.n() * param.n() * param.t.pow(param.r as u32));
+    let moduli = param.moduli;
+    let inner = param.inner_param();
+    let leaf = param.leaf_param();
+    let chunk = param.child_tensor_len();
 
-    // we start at the bottom level (the leaves of the hash tree) at i = 0
-    // the top level is at i = r-1
-    for i in 0..param.r {
-        let t_pow = param.t_pow_r_minus_i_1(i);
+    // root: v_0 is a share of Bits(d_1) \otimes Bits(phi_1)
+    let v_0 = moduli.round_vec(
+        half_niote::alice_decode_raw(e_mats[0].as_view(), psi[0][0].as_view()).as_view(),
+    );
+    let mut v_prev = pk
+        .prf
+        .lift_vec(moduli, lift_ctx(0, 0), Party::Alice, v_0.as_view());
 
-        // suppose e_mats[i] has dimension (tn \log q) x (tn \ell)
-        // internally a mat-vec multiplication happens on transpose of e_mats[i] in hOTE.alice_decode
-        // so the resulting vector has length tn \ell
-        // also there are t^{r - i - 1} of those vectors
-        let chunk_size = e_mats[i].shape().1; // this is tn \ell
-        let v_i_len = chunk_size * t_pow;
-        let mut v_i = na::DVector::zeros(v_i_len);
-
-        for j in 0..t_pow {
-            let v_ij = half_niote::alice_decode(e_mats[i].as_view(), psi[i][j].as_view());
-            debug_assert_eq!(v_ij.shape(), (chunk_size, 1));
-            v_i.rows_mut(chunk_size * j, chunk_size).copy_from(&v_ij);
-        }
-
-        if i == 0 {
-            acc += v_i;
-        } else {
-            let p_mat_prod = &pk.p_mat_prods[i - 1];
-            acc += (v_i.transpose() * p_mat_prod).transpose();
-        }
+    // inner levels: v_j^i is a share of Bits(d_{j+1}^i) \otimes Bits(phi_{j+1})
+    for j in 1..param.r - 1 {
+        assert_eq!(v_prev.len(), param.blocks(j) * chunk);
+        let v_j: Vec<_> = (0..param.blocks(j))
+            .map(|i| {
+                let raw = half_niote::alice_decode_raw(e_mats[j].as_view(), psi[j][i].as_view())
+                    + half_niote::apply_p(inner, &pk.inner, v_prev.rows(i * chunk, chunk));
+                let rounded = moduli.round_vec(raw.as_view());
+                pk.prf
+                    .lift_vec(moduli, lift_ctx(j, i), Party::Alice, rounded.as_view())
+            })
+            .collect();
+        v_prev = concat(&v_j);
     }
 
-    // debug_assert_eq!(acc.shape(), (param.m() * param.ell(), 1));
-    acc
+    // leaves: v_{r-1}^i is a share of x_i \otimes y
+    let j = param.r - 1;
+    assert_eq!(v_prev.len(), param.blocks(j) * chunk);
+    let v_leaf: Vec<_> = (0..param.blocks(j))
+        .map(|i| {
+            let raw = half_niote::alice_decode_raw(e_mats[j].as_view(), psi[j][i].as_view())
+                + half_niote::apply_p(leaf, &pk.leaf, v_prev.rows(i * chunk, chunk));
+            moduli.round_vec(raw.as_view())
+        })
+        .collect();
+    let v = concat(&v_leaf);
+    debug_assert_eq!(v.len(), param.m() * param.ell);
+    v
 }
 
-pub fn bob_decode<S: Scalar>(
+/// returns Bob's share w in Z_p^{m \ell}
+pub fn bob_decode<R: Ring>(
     param: NIOTEparam,
-    pk: &NIOTEpk<S>,
-    d_vec: na::DVectorView<S>,
-    phi: na::DVectorView<S>,
-) -> na::DVector<S> {
-    let w_r_minus_1 = half_niote::bob_decode(param.half, &pk.half, d_vec, phi);
-    if param.r == 1 {
-        w_r_minus_1
-    } else {
-        (w_r_minus_1.transpose() * &pk.p_mat_prods[param.r - 2]).transpose()
+    pk: &NIOTEpk<R>,
+    d_vec: na::DVectorView<R>,
+    phi: na::DVectorView<R>,
+) -> na::DVector<R> {
+    let moduli = param.moduli;
+    let inner = param.inner_param();
+    let leaf = param.leaf_param();
+    let chunk = param.child_tensor_len();
+
+    // root: w_0 is a share of Bits(d_1) \otimes Bits(phi_1)
+    let w_0 = half_niote::bob_decode(inner, &pk.inner, d_vec, phi);
+    let mut w_prev = pk
+        .prf
+        .lift_vec(moduli, lift_ctx(0, 0), Party::Bob, w_0.as_view());
+
+    // inner levels
+    for j in 1..param.r - 1 {
+        assert_eq!(w_prev.len(), param.blocks(j) * chunk);
+        let w_j: Vec<_> = (0..param.blocks(j))
+            .map(|i| {
+                let raw = half_niote::apply_p(inner, &pk.inner, w_prev.rows(i * chunk, chunk));
+                let rounded = moduli.round_vec(raw.as_view());
+                pk.prf
+                    .lift_vec(moduli, lift_ctx(j, i), Party::Bob, rounded.as_view())
+            })
+            .collect();
+        w_prev = concat(&w_j);
     }
+
+    // leaves
+    let j = param.r - 1;
+    assert_eq!(w_prev.len(), param.blocks(j) * chunk);
+    let w_leaf: Vec<_> = (0..param.blocks(j))
+        .map(|i| {
+            let raw = half_niote::apply_p(leaf, &pk.leaf, w_prev.rows(i * chunk, chunk));
+            moduli.round_vec(raw.as_view())
+        })
+        .collect();
+    concat(&w_leaf)
 }
 
-pub fn reconstruct<S: Scalar>(
+pub fn reconstruct<R: Ring>(
     param: NIOTEparam,
-    v: na::DVectorView<S>,
-    w: na::DVectorView<S>,
-) -> na::DVector<S> {
-    half_niote::reconstruct(param.half, v, w)
+    v: na::DVectorView<R>,
+    w: na::DVectorView<R>,
+) -> na::DVector<R> {
+    param.moduli.reduce_p_vec((v + w).as_view())
 }
 
 #[cfg(test)]
@@ -284,74 +302,82 @@ mod tests {
     use rand_chacha::ChaCha12Rng;
 
     use super::*;
+    use crate::ring::sample_vec;
 
-    fn run_protocol<S: Scalar>(k: usize, t: usize, r: usize, xs: Vec<S>, ys: Vec<bool>)
-    where
-        rand::distr::StandardUniform: rand::distr::Distribution<S>,
-    {
-        // if we only want one instance of hOTE, then we need to ensure that \ell = k \log q
-        let ell = ys.len();
-        let log_q = S::BIT_LENGTH as u64;
+    // keep every test well below this many bytes for the encoding and the public key
+    const MEM_BUDGET: usize = 128 << 20;
 
-        // m = t^r n
-        let n = xs.len() / t.pow(r as u32);
-        assert_eq!(n, ell);
-        let half = HalfNIOTEparam {
-            log_q,
-            m: n * t,
-            ell,
-            k,
-            stddev: 0.,
-        };
-        let param = NIOTEparam { half, t, r };
-        println!("[test] full niote with param: {param:?}");
+    fn run_protocol<R: Ring>(param: NIOTEparam) {
+        let mem = (param.encoding_len() + param.pk_len()) * size_of::<R>();
+        assert!(mem < MEM_BUDGET, "{param:?} needs about {} MiB", mem >> 20);
 
-        let mut rng = ChaCha12Rng::from_os_rng();
+        let mut rng = ChaCha12Rng::seed_from_u64(3);
+        let moduli = param.moduli;
+        let x_vec = sample_vec::<R, _>(param.m(), &mut rng).map(|x| x.low_bits(moduli.log_p));
+        let y_vec = sample_vec::<R, _>(param.ell, &mut rng).map(|x| x.low_bits(moduli.log_p));
+
         let pk = setup(param, &mut rng);
 
-        let x_vec = na::DVector::from_vec(xs);
         let (d_vec, psi) = alice_encode(param, &pk, x_vec.as_view());
+        assert_eq!(d_vec.len(), param.n());
+        assert_eq!(psi.len(), param.r);
+        for (j, psi_j) in psi.iter().enumerate() {
+            assert_eq!(psi_j.len(), param.blocks(j));
+        }
 
-        let y_vec = na::DVector::from_vec(ys.into_iter().map(|y| S::from_u64(y as u64)).collect());
         let (e_mats, phi) = bob_encode(param, &pk, y_vec.as_view(), &mut rng);
+        assert_eq!(e_mats.len(), param.r);
+        assert_eq!(phi.len(), param.k);
 
         let v_vec = alice_decode(param, &pk, &e_mats, &psi);
         let w_vec = bob_decode(param, &pk, d_vec.as_view(), phi.as_view());
+        assert_eq!(v_vec.len(), param.m() * param.ell);
+        assert_eq!(w_vec.len(), param.m() * param.ell);
 
-        let actual = reconstruct(param, v_vec.as_view(), w_vec.as_view());
-        let expected = x_vec.kronecker(&y_vec).map(|x| S::from_u64(x.as_u64() % 2));
-        assert_eq!(actual, expected);
+        let z = reconstruct(param, v_vec.as_view(), w_vec.as_view());
+        let expected = x_vec.kronecker(&y_vec).map(|x| x.low_bits(moduli.log_p));
+        assert_eq!(z, expected);
     }
 
-    #[test]
-    fn test_protocol_depth1() {
-        type MyScalar = Wrapping<u16>;
-        let t = 2;
-        let r = 1;
-        let k = 1; // normally k is big
-        let n = k * MyScalar::BIT_LENGTH;
-        run_protocol::<MyScalar>(
+    fn param(log_q: u32, log_p: u32, k: usize, t: usize, r: usize, ell: usize) -> NIOTEparam {
+        NIOTEparam {
+            moduli: Moduli::new(log_q, log_p),
             k,
             t,
             r,
-            vec![Wrapping(1); t.pow(r as u32) * n],
-            vec![true; n],
-        );
+            ell,
+            stddev: 3.2,
+        }
+    }
+
+    // NOTE: the tests use p = q. Without noise the protocol is then exact and
+    // rounding/lifting are the identity. For p < q, rounding and lifting fail with
+    // probability about 1/Delta and 1/p per coordinate, which requires a large log_q
+    // and makes the encoding too large for a unit test.
+
+    #[test]
+    fn test_protocol_u8_deep() {
+        run_protocol::<Wrapping<u8>>(param(8, 8, 1, 2, 4, 3));
     }
 
     #[test]
-    fn test_protocol_depth2() {
-        type MyScalar = Wrapping<u16>;
-        let t = 2;
-        let r = 2;
-        let k = 1; // normally k is big
-        let n = k * MyScalar::BIT_LENGTH;
-        run_protocol::<MyScalar>(
-            k,
-            t,
-            r,
-            vec![Wrapping(1); t.pow(r as u32) * n],
-            vec![true; n],
-        );
+    fn test_protocol_u16() {
+        run_protocol::<Wrapping<u16>>(param(16, 16, 1, 2, 2, 3));
+    }
+
+    #[test]
+    fn test_protocol_u16_masked() {
+        // log_q smaller than the word size
+        run_protocol::<Wrapping<u16>>(param(12, 12, 1, 2, 3, 5));
+    }
+
+    #[test]
+    fn test_protocol_u32_t3() {
+        run_protocol::<Wrapping<u32>>(param(16, 16, 1, 3, 2, 2));
+    }
+
+    #[test]
+    fn test_protocol_u64_k2() {
+        run_protocol::<Wrapping<u64>>(param(10, 10, 2, 2, 2, 4));
     }
 }
