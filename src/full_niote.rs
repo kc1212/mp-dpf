@@ -5,8 +5,9 @@
 //! Level j has t^j blocks.
 //! - The leaf level uses hOTE_ell for Z_p^{tn} \otimes Z_p^ell.
 //! - The inner levels j = r - 2, ..., 1 and the root use hOTE_n for
-//!   Z_p^{tn log q} \otimes Z_p^n, where Alice's input is the bit decomposition
-//!   of t child digests and Bob's input is Bits(phi_{j+1}).
+//!   Z_p^{tn l_b} \otimes Z_p^{k l_b}, where Alice's input is the base-b decomposition
+//!   of t child digests and Bob's input is the decomposition of phi_{j+1}.
+//!   Here l_b = ceil(log q / log b) is the number of digits, the paper uses b = 2.
 //!
 //! NOTE: the root uses hOTE_n instead of a hasher-private OTE,
 //! so the digest is not hasher-private.
@@ -16,7 +17,8 @@ use rand::{CryptoRng, Rng};
 
 use crate::{
     half_niote::{self, HalfNIOTEparam, HalfNIOTEpk},
-    ring::{Moduli, Party, Prf, Ring, bits},
+    noise::Noise,
+    ring::{Moduli, Party, Prf, Ring, decompose},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -30,7 +32,8 @@ pub struct NIOTEparam {
     pub r: usize,
     // length of Bob's input
     pub ell: usize,
-    pub stddev: f64,
+    // the noise distribution chi
+    pub noise: Noise,
 }
 
 impl NIOTEparam {
@@ -59,32 +62,40 @@ impl NIOTEparam {
             m: self.t * self.n(),
             ell: self.ell,
             k: self.k,
-            binary_input: false,
-            stddev: self.stddev,
+            noise: self.noise,
+            decomposed_input: false,
         }
     }
 
-    /// hOTE_n: Z_p^{tn log q} \otimes Z_p^n
+    /// hOTE_n: Z_p^{tn l_b} \otimes Z_p^{k l_b}
     pub fn inner_param(&self) -> HalfNIOTEparam {
+        let digits = self.moduli.digits_len();
         HalfNIOTEparam {
             moduli: self.moduli,
-            m: self.t * self.n() * self.log_q() as usize,
-            ell: self.n(),
+            m: self.t * self.n() * digits,
+            ell: self.k * digits,
             k: self.k,
-            binary_input: true,
-            stddev: self.stddev,
+            noise: self.noise,
+            decomposed_input: true,
         }
     }
 
-    /// Length of the shares of Bits(h) \otimes Bits(phi) for a single child digest h,
+    /// Length of the shares of decompose(h) \otimes decompose(phi) for a single child digest h,
     /// which is the input of the bilinear map P (or P').
     fn child_tensor_len(&self) -> usize {
-        self.n() * self.log_q() as usize * self.n()
+        half_niote::p_input_len(self.leaf_param())
+    }
+
+    /// The shares that are lifted are shares of products of two digits, i.e., of values
+    /// in [0, (b-1)^2]. Lifting needs (b-1)^2 < p/2 unless p = q (Corollary 2).
+    pub fn lifting_is_sound(&self) -> bool {
+        let m = &self.moduli;
+        m.log_p == m.log_q || 2 * m.log_b < m.log_p
     }
 
     /// log2 of an upper bound on the probability that v + w != x \otimes y (mod p) (Theorem 4),
-    /// using a union bound over all local roundings (Lemma 5) and
-    /// all liftings (Corollary 2 with B = 1, i.e., 2/p per coordinate).
+    /// using a union bound over all local roundings (Lemma 5) and all liftings
+    /// (Corollary 2 with B = (b-1)^2, i.e., ((b-1)^2 + 1)/p per coordinate).
     pub fn log2_failure_bound(&self) -> f64 {
         let leaf = self.leaf_param();
         let inner = self.inner_param();
@@ -99,25 +110,27 @@ impl NIOTEparam {
         let lifting = if self.moduli.log_p == self.moduli.log_q {
             0.0
         } else {
-            inner_coords * 2f64.powi(1 - self.moduli.log_p as i32)
+            let max = self.moduli.max_digit() as f64;
+            inner_coords * (max * max + 1.0) * 2f64.powi(-(self.moduli.log_p as i32))
         };
         (rounding + lifting).min(1.0).log2()
     }
 
     /// Total number of ring elements in the encoding E = (E_0, ..., E_{r-1}).
-    pub fn encoding_len(&self) -> usize {
+    /// It is a u128 since secure parameters overflow a u64.
+    pub fn encoding_len(&self) -> u128 {
         let leaf = self.leaf_param();
         let inner = self.inner_param();
-        leaf.m_bits() * leaf.out_len() + (self.r - 1) * inner.m_bits() * inner.out_len()
+        let size = |p: HalfNIOTEparam| p.m_hat() as u128 * p.out_len() as u128;
+        size(leaf) + (self.r as u128 - 1) * size(inner)
     }
 
-    /// Total number of ring elements in the public key.
-    pub fn pk_len(&self) -> usize {
-        let leaf = self.leaf_param();
-        let inner = self.inner_param();
-        let n = self.n();
-        n * (leaf.m_bits() + leaf.out_len() * self.k)
-            + n * (inner.m_bits() + inner.out_len() * self.k)
+    /// Total number of ring elements in the public key (A and B of both instances).
+    pub fn pk_len(&self) -> u128 {
+        let size = |p: HalfNIOTEparam| {
+            p.n() as u128 * (p.m_hat() as u128 + p.out_len() as u128 * p.k as u128)
+        };
+        size(self.leaf_param()) + size(self.inner_param())
     }
 }
 
@@ -129,6 +142,7 @@ pub struct NIOTEpk<R: Ring> {
 
 pub fn setup<R: Ring>(param: NIOTEparam, rng: &mut (impl Rng + CryptoRng)) -> NIOTEpk<R> {
     assert!(param.r >= 2, "the tree must have at least two levels");
+    assert!(param.lifting_is_sound(), "need (b-1)^2 < p/2 for lifting");
     NIOTEpk {
         leaf: half_niote::setup(param.leaf_param(), rng),
         inner: half_niote::setup(param.inner_param(), rng),
@@ -172,7 +186,7 @@ pub fn alice_encode<R: Ring>(
     // inner levels and root: hash t^j blocks of t bit-decomposed child digests
     let inner = param.inner_param();
     for j in (0..param.r - 1).rev() {
-        let d_hat = bits(concat(&digests).as_view(), param.log_q());
+        let d_hat = decompose(concat(&digests).as_view(), param.moduli);
         debug_assert_eq!(d_hat.len(), param.blocks(j) * inner.m);
         digests = Vec::with_capacity(param.blocks(j));
         for i in 0..param.blocks(j) {
@@ -201,7 +215,7 @@ pub fn bob_encode<R: Ring>(
     e_out.push(e_leaf);
 
     for _ in (0..param.r - 1).rev() {
-        let phi_hat = bits(phi.as_view(), param.log_q());
+        let phi_hat = decompose(phi.as_view(), param.moduli);
         let (e_j, phi_j) =
             half_niote::bob_encode(param.inner_param(), &pk.inner, phi_hat.as_view(), rng);
         e_out.push(e_j);
@@ -226,7 +240,7 @@ pub fn alice_decode<R: Ring>(
     let leaf = param.leaf_param();
     let chunk = param.child_tensor_len();
 
-    // root: v_0 is a share of Bits(d_1) \otimes Bits(phi_1)
+    // root: v_0 is a share of decompose(d_1) \otimes decompose(phi_1)
     let v_0 = moduli.round_vec(
         half_niote::alice_decode_raw(e_mats[0].as_view(), psi[0][0].as_view()).as_view(),
     );
@@ -234,7 +248,7 @@ pub fn alice_decode<R: Ring>(
         .prf
         .lift_vec(moduli, lift_ctx(0, 0), Party::Alice, v_0.as_view());
 
-    // inner levels: v_j^i is a share of Bits(d_{j+1}^i) \otimes Bits(phi_{j+1})
+    // inner levels: v_j^i is a share of decompose(d_{j+1}^i) \otimes decompose(phi_{j+1})
     for j in 1..param.r - 1 {
         assert_eq!(v_prev.len(), param.blocks(j) * chunk);
         let v_j: Vec<_> = (0..param.blocks(j))
@@ -276,7 +290,7 @@ pub fn bob_decode<R: Ring>(
     let leaf = param.leaf_param();
     let chunk = param.child_tensor_len();
 
-    // root: w_0 is a share of Bits(d_1) \otimes Bits(phi_1)
+    // root: w_0 is a share of decompose(d_1) \otimes decompose(phi_1)
     let w_0 = half_niote::bob_decode(inner, &pk.inner, d_vec, phi);
     let mut w_prev = pk
         .prf
@@ -326,13 +340,13 @@ mod tests {
     use super::*;
     use crate::ring::{centered, sample_vec};
 
-    // keep every test well below this many bytes for the encoding and the public key
-    const MEM_BUDGET: usize = 128 << 20;
-
     fn run_protocol<R: Ring>(param: NIOTEparam) {
-        let mem = (param.encoding_len() + param.pk_len()) * size_of::<R>();
-        assert!(mem < MEM_BUDGET, "{param:?} needs about {} MiB", mem >> 20);
-        assert_eq!(param.log2_failure_bound(), f64::NEG_INFINITY);
+        if param.noise == Noise::Zero {
+            assert_eq!(param.log2_failure_bound(), f64::NEG_INFINITY);
+        } else {
+            // make sure the test is not flaky
+            assert!(param.log2_failure_bound() < -20.0, "{param:?} is flaky");
+        }
 
         let mut rng = ChaCha12Rng::seed_from_u64(3);
         let moduli = param.moduli;
@@ -362,70 +376,121 @@ mod tests {
         assert_eq!(z, expected);
     }
 
-    fn param(log_q: u32, log_p: u32, k: usize, t: usize, r: usize, ell: usize) -> NIOTEparam {
+    fn param(moduli: Moduli, k: usize, t: usize, r: usize, ell: usize) -> NIOTEparam {
         NIOTEparam {
-            moduli: Moduli::new(log_q, log_p),
+            moduli,
             k,
             t,
             r,
             ell,
-            stddev: 0.0,
+            noise: Noise::Zero,
         }
     }
 
     // NOTE: the tests use p = q and no noise, the protocol is then exact and
     // rounding/lifting are the identity. With noise or p < q, local rounding and lifting
-    // fail with probability about (||e|| + 1)/Delta and 2/p per coordinate
+    // fail with probability about (||e|| + 1)/Delta and ((b-1)^2 + 1)/p per coordinate
     // (see `log2_failure_bound`), which requires a large log_q and makes the encodings
-    // too large for a unit test.
+    // and the public key too large for a unit test.
 
     #[test]
     fn test_protocol_u8_deep() {
-        run_protocol::<Wrapping<u8>>(param(8, 8, 1, 2, 4, 3));
+        run_protocol::<Wrapping<u8>>(param(Moduli::new(8, 8), 1, 2, 4, 3));
     }
 
     #[test]
     fn test_protocol_u16() {
-        run_protocol::<Wrapping<u16>>(param(16, 16, 1, 2, 2, 3));
+        run_protocol::<Wrapping<u16>>(param(Moduli::new(16, 16), 1, 2, 2, 3));
     }
 
     #[test]
     fn test_protocol_u16_masked() {
         // log_q smaller than the word size
-        run_protocol::<Wrapping<u16>>(param(12, 12, 1, 2, 3, 5));
+        run_protocol::<Wrapping<u16>>(param(Moduli::new(12, 12), 1, 2, 3, 5));
     }
 
     #[test]
     fn test_protocol_u32_t3() {
-        run_protocol::<Wrapping<u32>>(param(16, 16, 1, 3, 2, 2));
+        run_protocol::<Wrapping<u32>>(param(Moduli::new(16, 16), 1, 3, 2, 2));
     }
 
     #[test]
     fn test_protocol_u64_k2() {
-        run_protocol::<Wrapping<u64>>(param(10, 10, 2, 2, 2, 4));
+        run_protocol::<Wrapping<u64>>(param(Moduli::new(10, 10), 2, 2, 2, 4));
+    }
+
+    #[test]
+    fn test_protocol_gadget_base() {
+        // log_b does not divide log_q, so the last digit is smaller
+        run_protocol::<Wrapping<u8>>(param(Moduli::new(8, 8).with_gadget_base(3), 1, 2, 4, 3));
+        run_protocol::<Wrapping<u16>>(param(Moduli::new(12, 12).with_gadget_base(5), 2, 2, 3, 2));
+        run_protocol::<Wrapping<u16>>(param(Moduli::new(16, 16).with_gadget_base(4), 1, 3, 2, 3));
+        // the digits are the whole element
+        run_protocol::<Wrapping<u16>>(param(Moduli::new(16, 16).with_gadget_base(16), 1, 2, 3, 2));
+    }
+
+    #[test]
+    fn test_protocol_gadget_base_large_q() {
+        // a larger gadget base makes log q = 64 and 128 feasible
+        run_protocol::<Wrapping<u64>>(param(Moduli::new(64, 64).with_gadget_base(16), 1, 2, 3, 2));
+        run_protocol::<Wrapping<u128>>(param(
+            Moduli::new(128, 128).with_gadget_base(32),
+            1,
+            2,
+            2,
+            1,
+        ));
+    }
+
+    /// The full protocol with noise, p < q, rounding and lifting at every level.
+    /// This is the smallest such configuration: it needs k = 1 (no security) and about
+    /// 1.5 GB, see the README. It only runs in release builds since it is slow otherwise.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow without optimisations, use --release")]
+    fn test_protocol_noise_end_to_end() {
+        let param = NIOTEparam {
+            moduli: Moduli::new(127, 60).with_gadget_base(12),
+            k: 1,
+            t: 2,
+            r: 2,
+            ell: 1,
+            noise: Noise::default(),
+        };
+        run_protocol::<Wrapping<u128>>(param);
     }
 
     /// One decoding step of Figure 14 with noise, i.e., the induction step of Lemma 9:
-    /// given lifted shares of Bits(h) \otimes Bits(s) from the parent level, the parties
+    /// given lifted shares of decompose(h) \otimes decompose(s) from the parent level, the parties
     /// locally compute round(De_A^raw + P * v_hat) and round(P * w_hat), which must be
     /// shares of x \otimes y. A whole tree with noise is too large to test, see
     /// `examples/params.rs`.
-    fn check_level_with_noise<R: Ring>(moduli: Moduli, m: usize, ell: usize, binary_input: bool) {
+    fn check_level_with_noise<R: Ring>(
+        moduli: Moduli,
+        m: usize,
+        ell: usize,
+        noise: Noise,
+        decomposed_input: bool,
+    ) {
         let param = HalfNIOTEparam {
             moduli,
             m,
             ell,
             k: 1,
-            stddev: 3.2,
-            binary_input,
+            noise,
+            decomposed_input,
         };
-        let tensor_len = param.n() * moduli.log_q as usize * param.k * moduli.log_q as usize;
-        let lift_failure = tensor_len as f64 * 2f64.powi(1 - moduli.log_p as i32);
-        assert!(param.log2_rounding_failure() < -20.0 && lift_failure.log2() < -20.0);
+        let tensor_len = half_niote::p_input_len(param);
+        let max = moduli.max_digit() as f64;
+        let lift_failure =
+            tensor_len as f64 * (max * max + 1.0) * 2f64.powi(-(moduli.log_p as i32));
+        assert!(
+            param.log2_rounding_failure() < -20.0 && lift_failure.log2() < -20.0,
+            "{param:?} is flaky"
+        );
 
         let mut rng = ChaCha12Rng::seed_from_u64(6);
-        let x_vec = if binary_input {
-            na::DVector::from_fn(m, |_, _| R::from_bool(rng.random()))
+        let x_vec = if decomposed_input {
+            na::DVector::from_fn(m, |_, _| R::sample(&mut rng).low_bits(moduli.log_b))
         } else {
             sample_vec::<R, _>(m, &mut rng).map(|x| x.low_bits(moduli.log_p))
         };
@@ -436,8 +501,8 @@ mod tests {
         let (h, psi) = half_niote::alice_encode(param, &pk, x_vec.as_view());
         let (c_mat, s) = half_niote::bob_encode(param, &pk, y_vec.as_view(), &mut rng);
 
-        // the parent level outputs Z_p shares of Bits(h) \otimes Bits(s), which are lifted
-        let tensor = bits(h.as_view(), moduli.log_q).kronecker(&bits(s.as_view(), moduli.log_q));
+        // the parent level outputs Z_p shares of decompose(h) \otimes decompose(s), which are lifted
+        let tensor = decompose(h.as_view(), moduli).kronecker(&decompose(s.as_view(), moduli));
         assert_eq!(tensor.len(), tensor_len);
         let t0 = sample_vec::<R, _>(tensor_len, &mut rng).map(|x| x.low_bits(moduli.log_p));
         let t1 = (&tensor - &t0).map(|x| x.low_bits(moduli.log_p));
@@ -454,7 +519,7 @@ mod tests {
         assert!(e.iter().any(|x| *x != R::zero()));
         assert!(
             e.iter()
-                .all(|x| centered(*x, moduli.log_q).unsigned_abs() <= param.error_bound())
+                .all(|x| centered(*x, moduli.log_q).unsigned_abs() as f64 <= param.error_bound())
         );
 
         let v = moduli.round_vec(v_raw.as_view());
@@ -465,9 +530,17 @@ mod tests {
 
     #[test]
     fn test_level_with_noise() {
-        for binary_input in [false, true] {
-            check_level_with_noise::<Wrapping<u128>>(Moduli::new(100, 50), 2, 3, binary_input);
-            check_level_with_noise::<Wrapping<u128>>(Moduli::new(90, 45), 3, 2, binary_input);
+        let gaussian = Noise::DiscreteGaussian { stddev: 3.2 };
+        let tuniform = Noise::TUniform { log_bound: 0 };
+        for decomposed_input in [false, true] {
+            let moduli = Moduli::new(100, 50);
+            check_level_with_noise::<Wrapping<u128>>(moduli, 2, 3, gaussian, decomposed_input);
+            let moduli = Moduli::new(90, 45);
+            check_level_with_noise::<Wrapping<u128>>(moduli, 3, 2, tuniform, decomposed_input);
+            let moduli = Moduli::new(100, 53).with_gadget_base(8);
+            check_level_with_noise::<Wrapping<u128>>(moduli, 2, 3, gaussian, decomposed_input);
+            let moduli = Moduli::new(128, 72).with_gadget_base(16);
+            check_level_with_noise::<Wrapping<u128>>(moduli, 3, 2, tuniform, decomposed_input);
         }
     }
 }

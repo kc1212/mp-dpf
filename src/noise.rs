@@ -9,16 +9,107 @@ use crate::ring::Ring;
 /// so chi is B-bounded with B = ceil(TAILCUT * stddev) as required by the paper.
 pub const TAILCUT: f64 = 6.0;
 
-/// Bound B on the absolute value of a sample of chi.
-pub fn noise_bound(stddev: f64) -> u64 {
-    (TAILCUT * stddev).ceil() as u64
+/// The noise distribution chi, which must be B-bounded with B = `bound()`.
+/// The default is TUniform(0), i.e., {-1, 0, 1} with probabilities (1/4, 1/2, 1/4):
+/// it is exactly bounded with B = 1, so it needs the smallest q for the same security,
+/// see the README.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Noise {
+    Zero,
+    /// Discrete Gaussian with standard deviation `stddev`, truncated at TAILCUT * stddev.
+    DiscreteGaussian {
+        stddev: f64,
+    },
+    /// Uniform on [-2^log_bound, 2^log_bound], where the two end points have half the
+    /// probability of the other points, i.e., `ND.TUniform(log_bound)` in the lattice estimator.
+    TUniform {
+        log_bound: u32,
+    },
+}
+
+impl Default for Noise {
+    fn default() -> Self {
+        Noise::TUniform { log_bound: 0 }
+    }
+}
+
+impl Noise {
+    /// Bound B on the absolute value of a sample.
+    pub fn bound(&self) -> u64 {
+        match self {
+            Noise::Zero => 0,
+            Noise::DiscreteGaussian { stddev } => (TAILCUT * stddev).ceil() as u64,
+            Noise::TUniform { log_bound } => 1 << log_bound,
+        }
+    }
+
+    /// Standard deviation of the (untruncated) distribution.
+    pub fn stddev(&self) -> f64 {
+        match self {
+            Noise::Zero => 0.0,
+            Noise::DiscreteGaussian { stddev } => *stddev,
+            Noise::TUniform { log_bound } => {
+                ((2f64.powi(2 * *log_bound as i32 + 1) + 1.0) / 6.0).sqrt()
+            }
+        }
+    }
+
+    pub fn sampler(&self) -> NoiseSampler {
+        match self {
+            Noise::Zero => NoiseSampler::Zero,
+            Noise::DiscreteGaussian { stddev } => {
+                NoiseSampler::DiscreteGaussian(DiscreteGaussian::new(*stddev))
+            }
+            Noise::TUniform { log_bound } => {
+                assert!(*log_bound < 62);
+                NoiseSampler::TUniform {
+                    log_bound: *log_bound,
+                }
+            }
+        }
+    }
+}
+
+/// NOTE: the samplers are not constant time.
+pub enum NoiseSampler {
+    Zero,
+    DiscreteGaussian(DiscreteGaussian),
+    TUniform { log_bound: u32 },
+}
+
+impl NoiseSampler {
+    pub fn sample_i64<Rn: Rng + ?Sized>(&self, rng: &mut Rn) -> i64 {
+        match self {
+            NoiseSampler::Zero => 0,
+            NoiseSampler::DiscreteGaussian(chi) => chi.sample_i64(rng),
+            NoiseSampler::TUniform { log_bound } => {
+                // u - 2^b + c for u uniform in [0, 2^{b+1}) and a uniform bit c
+                // gives the end points with probability 2^{-(b+2)}
+                // and the other points with probability 2^{-(b+1)}
+                let u = rng.random_range(0..1i64 << (log_bound + 1));
+                u - (1i64 << log_bound) + rng.random::<bool>() as i64
+            }
+        }
+    }
+
+    pub fn sample<R: Ring, Rn: Rng + ?Sized>(&self, rng: &mut Rn) -> R {
+        let x = self.sample_i64(rng);
+        let abs = R::from_u64(x.unsigned_abs());
+        if x < 0 { -abs } else { abs }
+    }
+
+    /// mat += E where E is sampled entry-wise
+    pub fn add_to<R: Ring, Rn: Rng + ?Sized>(&self, mat: &mut na::DMatrix<R>, rng: &mut Rn) {
+        if matches!(self, NoiseSampler::Zero) {
+            return;
+        }
+        mat.iter_mut().for_each(|x| *x += self.sample(rng));
+    }
 }
 
 /// Discrete Gaussian over Z with standard deviation `stddev`,
 /// truncated to [-B, B], sampled with a cumulative distribution table.
 /// A standard deviation of 0 gives the zero distribution.
-///
-/// NOTE: the sampler is not constant time.
 pub struct DiscreteGaussian {
     bound: u64,
     // cdt[i] = 2^64 * Pr[X <= i - bound]
@@ -28,7 +119,7 @@ pub struct DiscreteGaussian {
 impl DiscreteGaussian {
     pub fn new(stddev: f64) -> Self {
         assert!(stddev >= 0.0);
-        let bound = noise_bound(stddev);
+        let bound = Noise::DiscreteGaussian { stddev }.bound();
         if bound == 0 {
             return Self {
                 bound,
@@ -69,20 +160,6 @@ impl DiscreteGaussian {
         let idx = self.cdt.partition_point(|c| *c < u);
         idx as i64 - self.bound as i64
     }
-
-    pub fn sample<R: Ring, Rn: Rng + ?Sized>(&self, rng: &mut Rn) -> R {
-        let x = self.sample_i64(rng);
-        let abs = R::from_u64(x.unsigned_abs());
-        if x < 0 { -abs } else { abs }
-    }
-
-    /// mat += E where E is sampled from chi entry-wise
-    pub fn add_to<R: Ring, Rn: Rng + ?Sized>(&self, mat: &mut na::DMatrix<R>, rng: &mut Rn) {
-        if self.is_zero() {
-            return;
-        }
-        mat.iter_mut().for_each(|x| *x += self.sample(rng));
-    }
 }
 
 #[cfg(test)]
@@ -100,7 +177,7 @@ mod tests {
         let mut rng = ChaCha12Rng::seed_from_u64(4);
         for stddev in [0.5, 1.0, 3.2, 10.0] {
             let chi = DiscreteGaussian::new(stddev);
-            assert_eq!(chi.bound(), noise_bound(stddev));
+            assert_eq!(chi.bound(), Noise::DiscreteGaussian { stddev }.bound());
 
             let samples: Vec<i64> = (0..100_000).map(|_| chi.sample_i64(&mut rng)).collect();
             assert!(samples.iter().all(|x| x.unsigned_abs() <= chi.bound()));
@@ -127,16 +204,61 @@ mod tests {
     }
 
     #[test]
-    fn test_discrete_gaussian_ring() {
+    fn test_tuniform() {
+        let mut rng = ChaCha12Rng::seed_from_u64(6);
+        for log_bound in [0, 1, 3, 8] {
+            let noise = Noise::TUniform { log_bound };
+            let chi = noise.sampler();
+            let bound = noise.bound() as i64;
+            let n = 200_000;
+            let samples: Vec<i64> = (0..n).map(|_| chi.sample_i64(&mut rng)).collect();
+            assert!(samples.iter().all(|x| x.abs() <= bound));
+            assert!(samples.contains(&bound) && samples.contains(&-bound));
+
+            let mean = samples.iter().sum::<i64>() as f64 / n as f64;
+            let std = (samples
+                .iter()
+                .map(|x| (*x as f64 - mean).powi(2))
+                .sum::<f64>()
+                / n as f64)
+                .sqrt();
+            assert!(
+                mean.abs() < 0.02 * noise.stddev().max(1.0),
+                "log_bound {log_bound}: mean {mean}"
+            );
+            assert!(
+                (std - noise.stddev()).abs() < 0.02 * noise.stddev(),
+                "log_bound {log_bound}: measured {std}, expected {}",
+                noise.stddev()
+            );
+
+            // the end points have probability 2^{-(b+2)}
+            let ends = samples.iter().filter(|x| x.abs() == bound).count() as f64 / n as f64;
+            let expected = 2.0 * 2f64.powi(-(log_bound as i32 + 2));
+            assert!(
+                (ends - expected).abs() < 0.1 * expected,
+                "log_bound {log_bound}: {ends}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_noise_ring() {
         let mut rng = ChaCha12Rng::seed_from_u64(5);
-        let chi = DiscreteGaussian::new(3.2);
-        for _ in 0..1000 {
-            let x: Wrapping<u16> = chi.sample(&mut rng);
-            assert!(centered(x, 12).unsigned_abs() <= chi.bound() as u128);
+        for noise in [
+            Noise::DiscreteGaussian { stddev: 3.2 },
+            Noise::TUniform { log_bound: 2 },
+        ] {
+            let chi = noise.sampler();
+            for _ in 0..1000 {
+                let x: Wrapping<u16> = chi.sample(&mut rng);
+                assert!(centered(x, 12).unsigned_abs() <= noise.bound() as u128);
+            }
         }
 
-        let zero = DiscreteGaussian::new(0.0);
-        assert!(zero.is_zero());
+        assert_eq!(Noise::default().bound(), 1);
+        let zero = Noise::Zero.sampler();
         assert!((0..100).all(|_| zero.sample_i64(&mut rng) == 0));
+        assert!(DiscreteGaussian::new(0.0).is_zero());
     }
 }

@@ -1,62 +1,68 @@
-//! Prints the smallest log q (and the best log p for it) such that the succinct NIOTE
-//! is correct except with probability 2^-40, together with the encoding size.
+//! Checks the 128-bit secure parameter sets from the README with the library's own
+//! correctness bound (`NIOTEparam::log2_failure_bound`) and prints their sizes.
+//!
+//! The parameters were found with `scripts/param_search.py` (lattice estimator, 128-bit
+//! security against primal uSVP under the default cost model, uniform secret) and a
+//! correctness failure probability of at most 2^-40, for t = 2, r = 2, ell = 1 and
+//! TUniform(0) noise.
 //!
 //! cargo run --release --example params
 
-use mp_dpf::{full_niote::NIOTEparam, ring::Moduli};
+use mp_dpf::{full_niote::NIOTEparam, noise::Noise, ring::Moduli};
 
-const TARGET_LOG2_FAILURE: f64 = -40.0;
-const STDDEV: f64 = 3.2;
+// (log_b, k, log_q, log_p)
+const SECURE: [(u32, usize, u32, u32); 8] = [
+    (1, 9089, 236, 93),
+    (4, 9128, 237, 96),
+    (8, 9434, 245, 102),
+    (16, 10227, 266, 117),
+    (24, 11097, 289, 133),
+    (32, 12014, 313, 148),
+    (40, 12906, 337, 164),
+    (48, 13821, 361, 180),
+];
 
-fn best_log_p(log_q: u32, k: usize, t: usize, r: usize, ell: usize) -> Option<(u32, f64)> {
-    (1..log_q)
-        .map(|log_p| {
-            let param = NIOTEparam {
-                moduli: Moduli::new(log_q, log_p),
-                k,
-                t,
-                r,
-                ell,
-                stddev: STDDEV,
-            };
-            (log_p, param.log2_failure_bound())
-        })
-        .min_by(|a, b| a.1.total_cmp(&b.1))
+fn human(bytes: f64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB"];
+    let mut b = bytes;
+    for u in units {
+        if b < 1024.0 || u == "ZiB" {
+            return format!("{b:.1} {u}");
+        }
+        b /= 1024.0;
+    }
+    unreachable!()
 }
 
 fn main() {
-    println!("stddev = {STDDEV}, target failure <= 2^{TARGET_LOG2_FAILURE}");
     println!(
-        "{:>3} {:>3} {:>3} {:>4} | {:>6} {:>6} {:>10} | {:>14}",
-        "k", "t", "r", "ell", "log_q", "log_p", "log2 fail", "encoding (GiB)"
+        "{:>5} {:>6} {:>5} {:>5} | {:>9} | {:>12} {:>12} {:>10}",
+        "log_b", "k", "log_q", "log_p", "log2 fail", "encoding", "B", "digest"
     );
-    for k in [1, 2, 4] {
-        for t in [2, 4] {
-            for r in [2, 3] {
-                let ell = 1;
-                let found = (8..=256).find_map(|log_q| {
-                    best_log_p(log_q, k, t, r, ell)
-                        .filter(|(_, fail)| *fail <= TARGET_LOG2_FAILURE)
-                        .map(|(log_p, fail)| (log_q, log_p, fail))
-                });
-                let Some((log_q, log_p, fail)) = found else {
-                    println!("{k:>3} {t:>3} {r:>3} {ell:>4} | none up to log_q = 256");
-                    continue;
-                };
-                let param = NIOTEparam {
-                    moduli: Moduli::new(log_q, log_p),
-                    k,
-                    t,
-                    r,
-                    ell,
-                    stddev: STDDEV,
-                };
-                let word_bytes = log_q.div_ceil(8).next_power_of_two() as f64;
-                let gib = param.encoding_len() as f64 * word_bytes / (1u64 << 30) as f64;
-                println!(
-                    "{k:>3} {t:>3} {r:>3} {ell:>4} | {log_q:>6} {log_p:>6} {fail:>10.1} | {gib:>14.1}"
-                );
-            }
-        }
+    for (log_b, k, log_q, log_p) in SECURE {
+        let param = NIOTEparam {
+            moduli: Moduli::new(log_q, log_p).with_gadget_base(log_b),
+            k,
+            t: 2,
+            r: 2,
+            ell: 1,
+            noise: Noise::default(),
+        };
+        assert!(param.lifting_is_sound());
+        let fail = param.log2_failure_bound();
+        assert!(fail <= -40.0, "{param:?}: 2^{fail}");
+
+        let elem_bytes = log_q as f64 / 8.0;
+        // the public key is dominated by B, which can be expanded from a seed
+        let leaf = param.leaf_param();
+        let inner = param.inner_param();
+        let b_elems = (param.n() * k) as f64 * (leaf.out_len() + inner.out_len()) as f64;
+        assert!(b_elems <= param.pk_len() as f64);
+        println!(
+            "{log_b:>5} {k:>6} {log_q:>5} {log_p:>5} | {fail:>9.1} | {:>12} {:>12} {:>10}",
+            human(param.encoding_len() as f64 * elem_bytes),
+            human(b_elems * elem_bytes),
+            human(param.n() as f64 * elem_bytes),
+        );
     }
 }

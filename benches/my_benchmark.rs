@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use mp_dpf::{half_niote, half_niote::HalfNIOTEparam, ring::Moduli};
+use mp_dpf::{half_niote, half_niote::HalfNIOTEparam, noise::Noise, ring::Moduli};
 use nalgebra as na;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
@@ -13,8 +13,8 @@ fn half_niote_bob_encode(c: &mut Criterion) {
         m: xs.len(),
         ell: ys.len(),
         k: 2,
-        binary_input: false,
-        stddev: 3.2,
+        noise: Noise::default(),
+        decomposed_input: false,
     };
 
     let mut rng = ChaCha12Rng::from_os_rng();
