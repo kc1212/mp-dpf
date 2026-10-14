@@ -530,17 +530,17 @@ mod tests {
 
     #[test]
     fn test_level_with_noise() {
-        let gaussian = Noise::DiscreteGaussian { stddev: 3.2 };
-        let tuniform = Noise::TUniform { log_bound: 0 };
+        let tuniform0 = Noise::TUniform { log_bound: 0 };
+        let tuniform2 = Noise::TUniform { log_bound: 2 };
         for decomposed_input in [false, true] {
             let moduli = Moduli::new(100, 50);
-            check_level_with_noise::<Wrapping<u128>>(moduli, 2, 3, gaussian, decomposed_input);
+            check_level_with_noise::<Wrapping<u128>>(moduli, 2, 3, tuniform2, decomposed_input);
             let moduli = Moduli::new(90, 45);
-            check_level_with_noise::<Wrapping<u128>>(moduli, 3, 2, tuniform, decomposed_input);
+            check_level_with_noise::<Wrapping<u128>>(moduli, 3, 2, tuniform0, decomposed_input);
             let moduli = Moduli::new(100, 53).with_gadget_base(8);
-            check_level_with_noise::<Wrapping<u128>>(moduli, 2, 3, gaussian, decomposed_input);
+            check_level_with_noise::<Wrapping<u128>>(moduli, 2, 3, tuniform2, decomposed_input);
             let moduli = Moduli::new(128, 72).with_gadget_base(16);
-            check_level_with_noise::<Wrapping<u128>>(moduli, 3, 2, tuniform, decomposed_input);
+            check_level_with_noise::<Wrapping<u128>>(moduli, 3, 2, tuniform0, decomposed_input);
         }
     }
 }

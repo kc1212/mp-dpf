@@ -10,8 +10,7 @@ builds on [AMR25](https://eprint.iacr.org/2025/336) (Constructions 3.4 and 3.6).
   of a hasher-private OTE, so the digest is not hasher-private.
 - `src/ring.rs`: arithmetic over Z_q with q = 2^log_q, generic over the storage word
   (`Wrapping<u8>` up to `Wrapping<u128>`), gadget decomposition, rounding and lifting.
-- `src/noise.rs`: the noise distribution: t-uniform (the default) or a truncated
-  discrete Gaussian.
+- `src/noise.rs`: the noise distribution (t-uniform).
 
 Two extensions of the paper are parameters:
 
@@ -21,8 +20,7 @@ Two extensions of the paper are parameters:
   of NIOTE"). Its constants in Lemma 5, Corollary 2 and Theorem 4 change: the noise bound
   gains a factor `b - 1`, and the lifted values are at most `(b - 1)^2` instead of 1. The
   security argument is unchanged, since `A` stays binary and `n = k·log_q`.
-- **Noise** `Noise::TUniform { log_bound }` (the default, with `log_bound = 0`) or
-  `Noise::DiscreteGaussian { stddev }` (truncated at 6σ).
+- **Noise** `Noise::TUniform { log_bound }` (the default is `log_bound = 0`).
 
 ## Tests
 

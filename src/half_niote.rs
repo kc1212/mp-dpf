@@ -281,7 +281,7 @@ mod tests {
     use super::*;
     use crate::ring::centered;
 
-    const GAUSSIAN: Noise = Noise::DiscreteGaussian { stddev: 3.2 };
+    const NOISE: Noise = Noise::TUniform { log_bound: 2 };
 
     fn gen_vec_wrapping(m: usize) -> StrategyFor<Vec<Wrapping<u64>>> {
         arbitrary_with(size_range(m).lift())
@@ -299,7 +299,7 @@ mod tests {
                 m: xs.len(),
                 ell: ys.len(),
                 k: 2,
-                noise: GAUSSIAN,
+                noise: NOISE,
                 decomposed_input: false,
             };
             let x_vec = na::DVector::from_vec(xs);
@@ -422,9 +422,9 @@ mod tests {
     #[test]
     fn test_protocol_noise() {
         let configs = [
-            (Moduli::new(64, 20), 4, 3, 1, GAUSSIAN),
-            (Moduli::new(64, 16), 4, 3, 2, GAUSSIAN),
-            (Moduli::new(64, 20), 2, 5, 1, GAUSSIAN),
+            (Moduli::new(64, 20), 4, 3, 1, NOISE),
+            (Moduli::new(64, 16), 4, 3, 2, NOISE),
+            (Moduli::new(64, 20), 2, 5, 1, NOISE),
             (
                 Moduli::new(64, 20),
                 4,
@@ -439,7 +439,7 @@ mod tests {
                 2,
                 Noise::TUniform { log_bound: 3 },
             ),
-            (Moduli::new(64, 16).with_gadget_base(8), 4, 3, 1, GAUSSIAN),
+            (Moduli::new(64, 16).with_gadget_base(8), 4, 3, 1, NOISE),
             (
                 Moduli::new(64, 16).with_gadget_base(8),
                 3,
@@ -469,7 +469,7 @@ mod tests {
                 let moduli = Moduli::new(128, 64).with_gadget_base(log_b);
                 let param = HalfNIOTEparam {
                     decomposed_input,
-                    ..param(moduli, 2, 3, 1, GAUSSIAN)
+                    ..param(moduli, 2, 3, 1, NOISE)
                 };
                 assert!(param.log2_rounding_failure() < -20.0, "{param:?}");
                 assert!(check_protocol::<Wrapping<u128>>(param), "{param:?}");
@@ -482,12 +482,12 @@ mod tests {
         // Delta = 4 is much smaller than the noise, so rounding must fail
         let moduli = Moduli::new(64, 62);
         assert!(!check_protocol::<Wrapping<u64>>(param(
-            moduli, 4, 3, 1, GAUSSIAN
+            moduli, 4, 3, 1, NOISE
         )));
     }
 
     fn check_apply_p<R: Ring>(moduli: Moduli, m: usize, ell: usize, k: usize) {
-        let param = param(moduli, m, ell, k, GAUSSIAN);
+        let param = param(moduli, m, ell, k, NOISE);
         let mut rng = ChaCha12Rng::seed_from_u64(2);
         let pk = setup::<R>(param, &mut rng);
         let d = sample_vec::<R, _>(param.n(), &mut rng);
